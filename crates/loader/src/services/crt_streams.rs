@@ -19,7 +19,7 @@
 //! A pointer that is no stream, reading `stdin` and closing a standard stream
 //! are not modelled and stop the guest with the runtime-limit fault.
 
-use super::crt_files::{self, EACCES, EBADF, EEXIST, EINVAL, ENOENT, ERANGE, FileStreams};
+use super::crt_files::{self, EACCES, EBADF, EEXIST, EINVAL, ENOENT, ENOSPC, ERANGE, FileStreams};
 use super::crt_format::{self, Floats, FormatError, Source};
 use super::crt_scan;
 use super::files::DriveEntry;
@@ -207,6 +207,47 @@ fn drive_name(memory: &GuestMemory, name: u64) -> Result<Option<Option<String>>,
         return Ok(None);
     }
     Ok(Some(ObjectState::drive_path(&bytes)))
+}
+
+/// The wide form of `drive_name`: the CRT wide file services take UTF-16
+/// names. The drive's names are ASCII, so a name with a character beyond
+/// ASCII is one the drive rejects, as a rejected narrow name is.
+fn drive_name_wide(memory: &GuestMemory, name: u64) -> Result<Option<Option<String>>, ExitReason> {
+    if name == 0 {
+        return Ok(None);
+    }
+    let mut units = Vec::new();
+    for index in 0..MAX_NAME + 1 {
+        let unit = memory.read_u16(name + index * 2).map_err(fault)?;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    if units.len() as u64 > MAX_NAME || units.is_empty() {
+        return Ok(None);
+    }
+    if !units.iter().all(|&unit| unit < 0x80) {
+        return Ok(Some(None));
+    }
+    let bytes: Vec<u8> = units.iter().map(|&unit| unit as u8).collect();
+    Ok(Some(ObjectState::drive_path(&bytes)))
+}
+
+/// The bytes of a wide mode string, ASCII like the narrow one.
+fn wide_ascii(memory: &GuestMemory, address: u64, limit: u64) -> Result<Vec<u8>, MemoryError> {
+    let mut units = Vec::new();
+    for index in 0..limit {
+        let unit = memory.read_u16(address + index * 2)?;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    if !units.iter().all(|&unit| unit < 0x80) {
+        return Err(MemoryError::UnmappedAddress(0));
+    }
+    Ok(units.iter().map(|&unit| unit as u8).collect())
 }
 
 pub(super) fn c_string(
@@ -2093,6 +2134,187 @@ impl StandardStreams {
             Some(byte) => u32::from(byte),
             None => 0xFFFF,
         }
+    }
+
+    /// `_wfopen`: the wide form of `open`; the name and the mode are
+    /// UTF-16. Anything beyond ASCII in either is a name or mode the drive
+    /// rejects, as a rejected narrow one is.
+    pub(super) fn open_wide(
+        &mut self,
+        memory: &mut GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+        mode: u64,
+    ) -> Outcome<u64> {
+        if name == 0 || mode == 0 {
+            return Ok(Err(Failed(0, EINVAL)));
+        }
+        let Some(Some(path)) = drive_name_wide(memory, name)? else {
+            return Ok(Err(Failed(0, EINVAL)));
+        };
+        let mode = wide_ascii(memory, mode, 16).map_err(|_| RUNTIME_LIMIT)?;
+        Ok(self
+            .opened
+            .open(memory, drive, path.as_bytes(), &mode)
+            .map_err(|errno| Failed(0, errno)))
+    }
+
+    /// `_unlink` and `_wunlink`: delete a file. 0, or -1 with `ENOENT` for
+    /// a name the drive does not hold, `EACCES` for a directory or a
+    /// read-only file, `EINVAL` for a null or rejected name.
+    pub(super) fn unlink_file(
+        &self,
+        memory: &GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+        wide: bool,
+    ) -> Outcome<i32> {
+        let resolved = if wide {
+            drive_name_wide(memory, name)?
+        } else {
+            drive_name(memory, name)?
+        };
+        let Some(Some(path)) = resolved else {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        Ok(match drive.drive_entry(&path) {
+            DriveEntry::File => {
+                if drive.drive_remove(&path) {
+                    Ok(0)
+                } else {
+                    Err(Failed(-1, EACCES))
+                }
+            }
+            DriveEntry::Directory => Err(Failed(-1, EACCES)),
+            DriveEntry::Missing { .. } => Err(Failed(-1, ENOENT)),
+        })
+    }
+
+    /// `_access` and `_waccess`: whether the name exists, and whether it
+    /// answers the mode bits. 0, or -1 with `ENOENT` for a missing name,
+    /// `EACCES` when a write bit meets a read-only file, `EINVAL` for a
+    /// null or rejected name or a mode with other bits.
+    pub(super) fn access_file(
+        &self,
+        memory: &GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+        wide: bool,
+        mode: u32,
+    ) -> Outcome<i32> {
+        if mode & !6 != 0 {
+            return Ok(Err(Failed(-1, EINVAL)));
+        }
+        let resolved = if wide {
+            drive_name_wide(memory, name)?
+        } else {
+            drive_name(memory, name)?
+        };
+        let Some(Some(path)) = resolved else {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        Ok(match drive.drive_entry(&path) {
+            DriveEntry::File | DriveEntry::Directory => {
+                if mode & 2 != 0 && drive.drive_is_readonly(&path) {
+                    Err(Failed(-1, EACCES))
+                } else {
+                    Ok(0)
+                }
+            }
+            DriveEntry::Missing { .. } => Err(Failed(-1, ENOENT)),
+        })
+    }
+
+    /// `_wmkdir`: create a directory. 0, or -1 with `EACCES` when the name
+    /// is taken, `ENOENT` when its parent is missing, `EINVAL` for a null
+    /// or rejected name.
+    pub(super) fn make_dir_wide(
+        &self,
+        memory: &GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+    ) -> Outcome<i32> {
+        let Some(Some(path)) = drive_name_wide(memory, name)? else {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        match drive.drive_entry(&path) {
+            DriveEntry::Missing { parent: true } => {
+                if drive.drive_create_dir(&path) {
+                    Ok(Ok(0))
+                } else {
+                    Ok(Err(Failed(-1, ENOSPC)))
+                }
+            }
+            DriveEntry::Missing { parent: false } => Ok(Err(Failed(-1, ENOENT))),
+            _ => Ok(Err(Failed(-1, EACCES))),
+        }
+    }
+
+    /// `_wchmod`: the read-only bit of a file. 0, or -1 with `ENOENT` for a
+    /// missing file, `EINVAL` for a null or rejected name. The other
+    /// permission bits do not exist here: the drive's files are otherwise
+    /// readable and writable.
+    pub(super) fn chmod_wide(
+        &self,
+        memory: &GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+        mode: u32,
+    ) -> Outcome<i32> {
+        let Some(Some(path)) = drive_name_wide(memory, name)? else {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        if drive.drive_chmod(&path, mode & 0x80 == 0) {
+            Ok(Ok(0))
+        } else {
+            Ok(Err(Failed(-1, ENOENT)))
+        }
+    }
+
+    /// `_wstat64i32`: the 48-byte stat block of mingw-w64. The drive knows
+    /// sizes and the read-only mark; the times answer -1 because it has no
+    /// time stamps, the ids answer 0, the link count 1. The mode is the
+    /// regular-file or directory bit, read always, write unless read-only.
+    pub(super) fn stat_wide(
+        &self,
+        memory: &mut GuestMemory,
+        drive: &mut ObjectState,
+        name: u64,
+        output: u64,
+    ) -> Outcome<i32> {
+        let Some(Some(path)) = drive_name_wide(memory, name)? else {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        if output == 0 {
+            return Ok(Err(Failed(-1, EINVAL)));
+        };
+        let entry = drive.drive_entry(&path);
+        let (present, directory, size) = match entry {
+            DriveEntry::File => (
+                true,
+                false,
+                drive.drive_file(&path).map_or(0, |f| f.len() as u64),
+            ),
+            DriveEntry::Directory => (true, true, 0),
+            DriveEntry::Missing { .. } => (false, false, 0),
+        };
+        if !present {
+            return Ok(Err(Failed(-1, ENOENT)));
+        }
+        let mut block = [0u8; 48];
+        let readonly = drive.drive_is_readonly(&path);
+        let mut mode: u16 = if directory { 0x4000 } else { 0x8000 } | 0x100;
+        if !readonly {
+            mode |= 0x80;
+        }
+        block[6..8].copy_from_slice(&mode.to_le_bytes());
+        block[8..10].copy_from_slice(&1i16.to_le_bytes()); // st_nlink
+        block[20..24].copy_from_slice(&(size as u32).to_le_bytes());
+        for slot in [24, 32, 40] {
+            block[slot..slot + 8].copy_from_slice(&(-1i64).to_le_bytes());
+        }
+        memory.write_bytes(output, &block).map_err(fault)?;
+        Ok(Ok(0))
     }
 
     /// `perror`: the message, a colon and a space when there is a message,

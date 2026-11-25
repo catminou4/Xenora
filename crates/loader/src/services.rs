@@ -214,6 +214,9 @@ struct ObjectState {
     directories: BTreeSet<String>,
     /// Locked byte ranges per file path, as (owning handle, offset, length, exclusive).
     locks: BTreeMap<String, Vec<(u64, u64, u64, bool)>>,
+    /// Files the CRT `_wchmod` made read-only. Writes, truncation and
+    /// deletion of one fail; `_wstat` and `_access` report the mode.
+    readonly: BTreeSet<String>,
     next_temp: u32,
 }
 
@@ -1836,6 +1839,61 @@ pub(crate) mod handlers {
             });
         or_errno(context, outcome)
     }
+
+    pub fn _wfopen(context: &mut ServiceContext<'_>, name: u64, mode: u64) -> Outcome<u64> {
+        let outcome = {
+            let mut streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.open_wide(context.memory, &mut drive, name, mode)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn _wunlink(context: &mut ServiceContext<'_>, name: u64) -> Outcome<i32> {
+        let outcome = {
+            let streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.unlink_file(context.memory, &mut drive, name, true)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn _waccess(context: &mut ServiceContext<'_>, name: u64, mode: i32) -> Outcome<i32> {
+        let outcome = {
+            let streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.access_file(context.memory, &mut drive, name, true, mode as u32)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn _wmkdir(context: &mut ServiceContext<'_>, name: u64) -> Outcome<i32> {
+        let outcome = {
+            let streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.make_dir_wide(context.memory, &mut drive, name)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn _wchmod(context: &mut ServiceContext<'_>, name: u64, mode: i32) -> Outcome<i32> {
+        let outcome = {
+            let streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.chmod_wide(context.memory, &mut drive, name, mode as u32)
+        };
+        or_errno(context, outcome)
+    }
+
+    pub fn _wstat64i32(context: &mut ServiceContext<'_>, name: u64, output: u64) -> Outcome<i32> {
+        let outcome = {
+            let streams = context.state.crt_streams();
+            let mut drive = context.state.objects.lock().expect("guest object state");
+            streams.stat_wide(context.memory, &mut drive, name, output)
+        };
+        or_errno(context, outcome)
+    }
+
 
     /// `_mkdir` and `_rmdir` are drive operations the descriptor layer is no
     /// part of: the narrow path resolves as every drive path does.

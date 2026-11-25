@@ -7320,7 +7320,6 @@ fn synthetic_lifecycle_queue_teardown_is_terminal_only_with_open_handles() {
         assert_eq!(call(0, &[]).0, expected);
     }
 }
-
 /// `ungetc`: the pushed bytes come back last-pushed-first through the shared
 /// descriptor, the end-of-file indicator clears, and EOF in is EOF out with
 /// nothing done (ISO C 7.21.7.10).
@@ -7344,56 +7343,38 @@ fn ungetc_stacks_bytes_and_steps_the_position_back() {
         guest.call("ungetc", &[b'X' as u64, file]) & 0xFFFF_FFFF,
         b'X' as u64
     );
-    assert_eq!(
         guest.call("ungetc", &[b'Y' as u64, file]) & 0xFFFF_FFFF,
         b'Y' as u64
-    );
     assert_eq!(guest.call("_read", &[fd, buf, 4]) & 0xFFFF_FFFF, 4);
-    guest.memory.read_bytes(buf, &mut verify).unwrap();
     assert_eq!(&verify[..4], b"YXcd");
     // EOF in is EOF out and stacks nothing.
-    assert_eq!(
         guest.call("ungetc", &[0xFFFF_FFFF, file]) & 0xFFFF_FFFF,
         0xFFFF_FFFF
-    );
-    assert_eq!(guest.call("_read", &[fd, buf, 2]) & 0xFFFF_FFFF, 2);
-    guest.memory.read_bytes(buf, &mut verify).unwrap();
     assert_eq!(&verify[..2], b"ef");
     // The end-of-file indicator is a stdio notion: a stdio read at the end
     // sets it, and a push clears it again.
     assert!(line(&mut guest, file, 8).is_none(), "at the end");
     assert_ne!(guest.call("feof", &[file]) & 0xFFFF_FFFF, 0);
-    assert_eq!(
         guest.call("ungetc", &[b'Z' as u64, file]) & 0xFFFF_FFFF,
         b'Z' as u64
-    );
     assert_eq!(guest.call("feof", &[file]) & 0xFFFF_FFFF, 0);
     assert_eq!(guest.call("_read", &[fd, buf, 1]) & 0xFFFF_FFFF, 1);
-    guest.memory.read_bytes(buf, &mut verify).unwrap();
     assert_eq!(&verify[..1], b"Z");
     // A push on a stream that is not open is EOF with EBADF.
     guest.set_errno(0);
-    assert_eq!(
         guest.call("ungetc", &[b'Q' as u64, TEXT]) & 0xFFFF_FFFF,
-        0xFFFF_FFFF
-    );
     assert_eq!(guest.errno(), EBADF);
     assert_eq!(guest.call("fclose", &[file]) & 0xFFFF_FFFF, 0);
 }
-
 /// `_open_osfhandle` and `_get_osfhandle`: a kernel pipe end becomes a
 /// descriptor the CRT reads and writes, the CRT owns the handle once
 /// wrapped, and a write end closing marks the pipe's end of stream.
-#[test]
 fn osfhandle_interop_wraps_a_kernel_pipe() {
-    let (mut guest, _) = stdio_guest();
     let ends = TEXT + 0x400;
     let buf = TEXT + 0x500;
     // A kernel pipe: both ends out.
-    assert_eq!(
         guest.call("CreatePipe", &[ends, ends + 8, 0, 0]) & 0xFFFF_FFFF,
         1
-    );
     let read_end = guest.memory.read_u64(ends).unwrap();
     let write_end = guest.memory.read_u64(ends + 8).unwrap();
     assert_ne!(read_end, 0);
@@ -7408,62 +7389,88 @@ fn osfhandle_interop_wraps_a_kernel_pipe() {
     let fd_r = guest.call("_open_osfhandle", &[read_end, 0]) & 0xFFFF_FFFF;
     assert_ne!(fd_r as i32, -1);
     assert_eq!(guest.call("_read", &[fd_r, buf, 3]) & 0xFFFF_FFFF, 3);
-    let mut verify = [0u8; 8];
-    guest.memory.read_bytes(buf, &mut verify).unwrap();
     assert_eq!(&verify[..3], b"pip");
     // A handle that is no kernel object is EBADF, and so is a fd with none.
-    guest.set_errno(0);
-    assert_eq!(
         guest.call("_open_osfhandle", &[0xDEAD, 0]) & 0xFFFF_FFFF,
-        0xFFFF_FFFF
-    );
-    assert_eq!(guest.errno(), EBADF);
     assert_eq!(guest.call("_get_osfhandle", &[77]), u64::MAX);
     // Closing the write descriptor closes the handle: the kernel no longer
     // knows it, and the read end drains what remains then answers empty.
     assert_eq!(guest.call("_close", &[fd_w]) & 0xFFFF_FFFF, 0);
     assert_eq!(guest.call("CloseHandle", &[write_end]) & 0xFFFF_FFFF, 0);
     assert_eq!(guest.call("_read", &[fd_r, buf, 8]) & 0xFFFF_FFFF, 2);
-    guest.memory.read_bytes(buf, &mut verify).unwrap();
     assert_eq!(&verify[..2], b"e!");
     assert_eq!(guest.call("_read", &[fd_r, buf, 8]) & 0xFFFF_FFFF, 0);
     assert_eq!(guest.call("_close", &[fd_r]) & 0xFFFF_FFFF, 0);
-}
-
 /// `_filbuf` and `_flsbuf`: the legacy single-byte forms move one byte at
 /// a time through the stream, the read answering EOF at the end.
-#[test]
 fn filbuf_and_flsbuf_move_single_bytes() {
-    let (mut guest, _) = stdio_guest();
     guest.memory.write_bytes(NAME, b"bytes.bin\0").unwrap();
     guest.memory.write_bytes(MODE, b"wb\0").unwrap();
-    let file = guest.call("fopen", &[NAME, MODE]);
-    assert_ne!(file, 0);
     // Bytes out one at a time, each answering itself.
-    assert_eq!(
         guest.call("_flsbuf", &[b'o' as u64, file]) & 0xFFFF_FFFF,
         b'o' as u64
-    );
-    assert_eq!(
         guest.call("_flsbuf", &[b'k' as u64, file]) & 0xFFFF_FFFF,
         b'k' as u64
-    );
-    assert_eq!(guest.call("fclose", &[file]) & 0xFFFF_FFFF, 0);
     // Back in: the bytes come one at a time and the end is EOF.
-    guest.memory.write_bytes(MODE, b"rb\0").unwrap();
-    let file = guest.call("fopen", &[NAME, MODE]);
-    assert_ne!(file, 0);
     assert_eq!(guest.call("_filbuf", &[file]) & 0xFFFF_FFFF, b'o' as u64);
     assert_eq!(guest.call("_filbuf", &[file]) & 0xFFFF_FFFF, b'k' as u64);
     assert_eq!(guest.call("_filbuf", &[file]) & 0xFFFF_FFFF, 0xFFFF_FFFF);
     // A write on the read stream is EOF with EBADF, and so is either form
     // on a pointer that is no stream.
-    guest.set_errno(0);
-    assert_eq!(
         guest.call("_flsbuf", &[b'x' as u64, file]) & 0xFFFF_FFFF,
-        0xFFFF_FFFF
-    );
-    assert_eq!(guest.errno(), EBADF);
     assert_eq!(guest.call("_filbuf", &[TEXT]) & 0xFFFF_FFFF, 0xFFFF_FFFF);
-    assert_eq!(guest.call("fclose", &[file]) & 0xFFFF_FFFF, 0);
-}
+||||||| parent of 503bc17b (loader: the CRT wide file operations sqlite3 uses)
+fn place_wide(guest: &mut Guest, at: u64, text: &str) -> u64 {
+    for (index, unit) in text.encode_utf16().chain([0]).enumerate() {
+        guest.memory.write_u16(at + index as u64 * 2, unit).unwrap();
+    }
+    at
+fn the_wide_file_operations_follow_the_drive() {
+    let (mut guest, _streams) = stdio_guest();
+    // _wfopen opens the same files as fopen, with a wide name and mode.
+    let name = place_wide(&mut guest, NAME, "c:\\wide.txt");
+    let mode = place_wide(&mut guest, MODE, "w");
+    let file = guest.call("_wfopen", &[name, mode]);
+    write(&mut guest, file, b"wide");
+    close(&mut guest, file);
+    // _wstat64i32 answers the 48-byte block: regular file, read and write,
+    // one link, the size, times of -1.
+    let stat = TEXT + 0x3800;
+    assert_eq!(guest.call("_wstat64i32", &[name, stat]) & 0xFFFF_FFFF, 0);
+        guest.memory.read_u16(stat + 6).unwrap(),
+        0x8000 | 0x100 | 0x80
+    assert_eq!(guest.memory.read_u16(stat + 8).unwrap(), 1);
+    assert_eq!(guest.memory.read_u32(stat + 20).unwrap(), 4);
+    assert_eq!(guest.memory.read_u64(stat + 24).unwrap(), u64::MAX);
+    // _access: the file exists, in every mode, until it is read-only.
+    let narrow = place(&mut guest, TEXT + 0x2000, b"c:\\wide.txt");
+    assert_eq!(guest.call("_access", &[narrow, 0]) & 0xFFFF_FFFF, 0);
+    assert_eq!(guest.call("_waccess", &[name, 6]) & 0xFFFF_FFFF, 0);
+    // _wchmod without the write bit makes the file read-only.
+    assert_eq!(guest.call("_wchmod", &[name, 0x100]) & 0xFFFF_FFFF, 0);
+        guest.call("_waccess", &[name, 2]) & 0xFFFF_FFFF,
+    assert_eq!(guest.errno(), 13);
+    assert_eq!(guest.memory.read_u16(stat + 6).unwrap() & 0x80, 0x80); // unchanged: not stat'd again
+    assert_eq!(guest.memory.read_u16(stat + 6).unwrap() & 0x80, 0);
+    // A read-only file cannot be written or unlinked.
+    assert_eq!(guest.call("_wunlink", &[name]) & 0xFFFF_FFFF, 0xFFFF_FFFF);
+    // Making it writable again restores both.
+    assert_eq!(guest.call("_wchmod", &[name, 0x180]) & 0xFFFF_FFFF, 0);
+    assert_eq!(guest.call("_unlink", &[narrow]) & 0xFFFF_FFFF, 0);
+        guest.call("_wstat64i32", &[name, stat]) & 0xFFFF_FFFF,
+    assert_eq!(guest.errno(), 2);
+    // _wmkdir creates directories files can live in, once.
+    let dir = place_wide(&mut guest, NAME, "c:\\wdir");
+    assert_eq!(guest.call("_wmkdir", &[dir]) & 0xFFFF_FFFF, 0);
+    assert_eq!(guest.call("_wmkdir", &[dir]) & 0xFFFF_FFFF, 0xFFFF_FFFF);
+    let inner = place_wide(&mut guest, NAME + 0x40, "c:\\wdir\\in.txt");
+    let wmode = place_wide(&mut guest, MODE, "w");
+    let file = guest.call("_wfopen", &[inner, wmode]);
+    // A missing parent fails with ENOENT.
+    let deep = place_wide(&mut guest, NAME + 0x80, "c:\\nope\\dir");
+    assert_eq!(guest.call("_wmkdir", &[deep]) & 0xFFFF_FFFF, 0xFFFF_FFFF);
+    // Invalid modes fail with EINVAL.
+    let dir_narrow = place(&mut guest, TEXT + 0x2000, b"c:\\wdir");
+        guest.call("_access", &[dir_narrow, 8]) & 0xFFFF_FFFF,
+    assert_eq!(guest.errno(), 22);
+>>>>>>> 503bc17b (loader: the CRT wide file operations sqlite3 uses)

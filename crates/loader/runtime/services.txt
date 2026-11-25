@@ -692,24 +692,6 @@ service ucrtbase.dll _pipe(fds: ptr, size: u32, mode: i32) -> i32
 
 
 
-service ucrtbase.dll _access(name: ptr, mode: i32) -> i32
-    handler _access
-    status implemented
-    alias api-ms-win-crt-filesystem-l1-1-0.dll
-    alias msvcrt.dll
-    fails -1 with errno ENOENT for a missing or rejected name, EINVAL for a null or empty name or mode bits other than 0, 2, 4 and 6
-    ref io.h _access
-    test descriptors_share_files_with_streams
-
-service ucrtbase.dll _unlink(name: ptr) -> i32
-    handler _unlink
-    status implemented
-    alias api-ms-win-crt-filesystem-l1-1-0.dll
-    alias msvcrt.dll
-    fails -1 with errno ENOENT missing, EACCES for a directory, EINVAL for a null or empty name; it is remove by another name
-    ref io.h _unlink
-    test descriptors_share_files_with_streams
-
 # The C time services of package 5 of #459. The clock is UTC throughout:
 # Xenora has no answer for what zone the machine stands in, and the docs
 # say so.
@@ -1025,6 +1007,70 @@ service ucrtbase.dll _strdup(text: ptr) -> ptr
     ref string.h _strdup
     test legacy_strdup_and_ldexp_run
 
+
+service ucrtbase.dll _wfopen(name: ptr, mode: ptr) -> ptr
+    handler _wfopen
+    status partial
+    alias api-ms-win-crt-stdio-l1-1-0.dll
+    fails null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM
+    ref corecrt_wstdio.h _wfopen
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _unlink(name: ptr) -> i32
+    handler _unlink
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file
+    ref io.h _unlink
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _wunlink(name: ptr) -> i32
+    handler _wunlink
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file
+    ref corecrt_wio.h _wunlink
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _access(name: ptr, mode: i32) -> i32
+    handler _access
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file
+    ref io.h _access
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _waccess(name: ptr, mode: i32) -> i32
+    handler _waccess
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file
+    ref corecrt_wio.h _waccess
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _wmkdir(name: ptr) -> i32
+    handler _wmkdir
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL, ENOENT, ENOSPC or EACCES when the name is taken
+    ref corecrt_wdirect.h _wmkdir
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _wchmod(name: ptr, mode: i32) -> i32
+    handler _wchmod
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL or ENOENT
+    ref corecrt_wio.h _wchmod
+    test the_wide_file_operations_follow_the_drive
+
+service ucrtbase.dll _wstat64i32(name: ptr, output: ptr) -> i32
+    handler _wstat64i32
+    status partial
+    alias api-ms-win-crt-filesystem-l1-1-0.dll
+    fails -1 with errno EINVAL or ENOENT; the times answer -1 because the drive has no time stamps
+    ref corecrt_wio.h _wstat64i32, _mingw_stat64.h struct _stat64i32
+    test the_wide_file_operations_follow_the_drive
 
 service ucrtbase.dll perror(message: ptr) -> void
     handler perror

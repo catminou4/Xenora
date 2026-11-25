@@ -2219,9 +2219,44 @@ impl super::ObjectState {
         self.files.get(path).map(Vec::as_slice)
     }
 
+    pub(super) fn drive_is_readonly(&self, path: &str) -> bool {
+        self.readonly.contains(path)
+    }
+
+    /// `_wchmod`: set or clear the read-only mark of a file the drive holds.
+    pub(super) fn drive_chmod(&mut self, path: &str, readonly: bool) -> bool {
+        if !self.files.contains_key(path) {
+            return false;
+        }
+        if readonly {
+            self.readonly.insert(path.to_owned());
+        } else {
+            self.readonly.remove(path);
+        }
+        true
+    }
+
+    /// Create a directory. False when the parent is missing, the name is
+    /// taken or the drive holds all the directories it can.
+    pub(super) fn drive_create_dir(&mut self, path: &str) -> bool {
+        let parent = parent(path);
+        if self.directories.len() >= MAX_DIRECTORIES
+            || (!parent.is_empty() && !self.directories.contains(parent))
+            || self.directories.contains(path)
+            || self.files.contains_key(path)
+        {
+            return false;
+        }
+        self.directories.insert(path.to_owned());
+        true
+    }
+
     /// Delete a file. False when it does not exist. Streams that have it
     /// open keep their path, so their operations fail afterwards.
     pub(super) fn drive_remove(&mut self, path: &str) -> bool {
+        if self.readonly.contains(path) {
+            return false;
+        }
         self.files.remove(path).is_some()
     }
 
@@ -2242,6 +2277,9 @@ impl super::ObjectState {
     /// the file does not exist; `Some(false)`, with nothing written, when the
     /// write would pass the drive's size bound.
     pub(super) fn drive_write(&mut self, path: &str, position: u64, bytes: &[u8]) -> Option<bool> {
+        if self.readonly.contains(path) {
+            return Some(false);
+        }
         let used: usize = self.files.values().map(Vec::len).sum();
         let data = self.files.get_mut(path)?;
         let Some(end) = position
