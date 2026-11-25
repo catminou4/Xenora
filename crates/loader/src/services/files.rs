@@ -2270,6 +2270,9 @@ impl super::ObjectState {
 
     /// Empty a file. False when it does not exist.
     pub(super) fn drive_truncate(&mut self, path: &str) -> bool {
+        if self.readonly.contains(path) {
+            return false;
+        }
         self.files.get_mut(path).map(Vec::clear).is_some()
     }
 

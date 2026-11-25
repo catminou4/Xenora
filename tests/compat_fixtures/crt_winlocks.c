@@ -7,11 +7,13 @@
 // number and the program exits with it. With CRT_WINLOCKS_BREAK one
 // expectation is wrong on purpose.
 
+#include <direct.h>
 #include <errno.h>
 #include <io.h>
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <windows.h>
 
@@ -129,6 +131,39 @@ int main(void) {
 
     CHECK("process id", (DWORD)_getpid() == GetCurrentProcessId());
     CHECK("close", CloseHandle(first) && CloseHandle(second));
+
+    // The wide CRT file operations sqlite uses for most of its file names.
+    FILE *wide = _wfopen(L"c:\\wops.txt", L"w");
+    CHECK("wfopen write", wide != NULL && fwrite("wide", 1, 4, wide) == 4 && fclose(wide) == 0);
+
+    struct _stat64i32 st;
+    memset(&st, 0, sizeof st);
+    CHECK("wstat regular file",
+          _wstat64i32(L"c:\\wops.txt", &st) == 0 && (st.st_mode & _S_IFREG) != 0
+              && (st.st_mode & _S_IWRITE) != 0 && st.st_size == 4);
+    CHECK("wstat missing fails", _wstat64i32(L"c:\\wops-missing.txt", &st) == -1);
+
+    CHECK("access exists", _access("c:\\wops.txt", 0) == 0 && _waccess(L"c:\\wops.txt", 6) == 0);
+    CHECK("access missing fails", _waccess(L"c:\\wops-missing.txt", 0) == -1);
+
+    CHECK("chmod readonly", _wchmod(L"c:\\wops.txt", _S_IREAD) == 0);
+    CHECK("readonly write access fails", _waccess(L"c:\\wops.txt", 2) == -1);
+    CHECK("readonly write open fails", _wfopen(L"c:\\wops.txt", L"w") == NULL);
+    CHECK("readonly unlink fails", _wunlink(L"c:\\wops.txt") == -1);
+    errno = 0;
+    memset(&st, 0, sizeof st);
+    CHECK("readonly stat mode",
+          _wstat64i32(L"c:\\wops.txt", &st) == 0 && (st.st_mode & _S_IWRITE) == 0);
+    CHECK("chmod writable", _wchmod(L"c:\\wops.txt", _S_IREAD | _S_IWRITE) == 0);
+    CHECK("unlink narrow", _unlink("c:\\wops.txt") == 0);
+    CHECK("wstat unlinked fails", _wstat64i32(L"c:\\wops.txt", &st) == -1);
+
+    CHECK("wmkdir", _wmkdir(L"c:\\wdir") == 0);
+    CHECK("wmkdir existing fails", _wmkdir(L"c:\\wdir") == -1);
+    FILE *inner = _wfopen(L"c:\\wdir\\in.txt", L"w");
+    CHECK("file inside new directory", inner != NULL && fclose(inner) == 0);
+    CHECK("wmkdir missing parent fails", _wmkdir(L"c:\\nope\\dir") == -1);
+    CHECK("wunlink inner", _wunlink(L"c:\\wdir\\in.txt") == 0);
 
 #ifdef CRT_WINLOCKS_BREAK
     CHECK("the control fails", sectors == 999);

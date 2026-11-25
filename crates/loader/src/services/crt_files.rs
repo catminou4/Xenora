@@ -228,6 +228,10 @@ impl FileStreams {
             memory.release_heap_allocation(PROCESS_HEAP, file);
             return Err(ENOSPC);
         }
+        if mode.writable && drive.drive_is_readonly(&path) {
+            memory.release_heap_allocation(PROCESS_HEAP, file);
+            return Err(EACCES);
+        }
         if mode.truncate {
             drive.drive_truncate(&path);
         }
