@@ -1072,6 +1072,14 @@ service ucrtbase.dll _wstat64i32(name: ptr, output: ptr) -> i32
     ref corecrt_wio.h _wstat64i32, _mingw_stat64.h struct _stat64i32
     test the_wide_file_operations_follow_the_drive
 
+service ucrtbase.dll _assert(expression: ptr, file: ptr, line: u32) -> void
+    handler _assert
+    status partial
+    alias api-ms-win-crt-runtime-l1-1-0.dll
+    fails nothing; the message prints on stderr and the process ends with status 3, since no signal handler can exist here
+    ref assert.h _assert
+    test an_assertion_prints_and_ends_the_process
+
 service ucrtbase.dll _beginthreadex(security: ptr, stack_size: u64, start: ptr, arglist: ptr, initflag: u32, thrdaddr: ptr) -> ptr
     handler _beginthreadex
     status partial

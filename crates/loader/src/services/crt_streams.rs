@@ -2340,6 +2340,38 @@ impl StandardStreams {
         text.push(b'\n');
         self.write(drive, Stream::Error, &text).map(|_| ())
     }
+
+    /// `_assert`: "Assertion failed: <expression>, file <file>, line <line>"
+    /// and a newline on `stderr`, then the process ends with status 3. The
+    /// CRT's abort would raise SIGABRT first; no signal handler can exist
+    /// here, so the end is immediate. The debug dialog does not exist either:
+    /// there is no one to answer it.
+    pub(super) fn assert_failure(
+        &mut self,
+        memory: &GuestMemory,
+        drive: &mut ObjectState,
+        expression: u64,
+        file: u64,
+        line: u32,
+    ) -> Result<(), ExitReason> {
+        let read = |address| {
+            if address == 0 {
+                return Ok(Vec::new());
+            }
+            c_string(memory, address, MAX_TRANSFER + 1).map_err(fault)
+        };
+        let expression = read(expression)?;
+        let file = read(file)?;
+        let mut text = b"Assertion failed: ".to_vec();
+        text.extend_from_slice(&expression);
+        text.extend_from_slice(b", file ");
+        text.extend_from_slice(&file);
+        text.extend_from_slice(format!(", line {line}\n").as_bytes());
+        // The write is best-effort: even a stderr that cannot take the
+        // message does not stop the assertion from ending the process.
+        let _ = self.write(drive, Stream::Error, &text)?;
+        Err(ExitReason::ProcessExit(3))
+    }
 }
 
 /// The option bits the legacy CRT's printf family behaves with: the legacy

@@ -8,7 +8,7 @@ use crate::runtime::{Call, Parameter, Return, ServiceContext, ServiceMetadata};
 use crate::services::{ServicesState, handlers};
 use std::sync::Arc;
 
-pub static SERVICES: [ServiceMetadata; 244] = [
+pub static SERVICES: [ServiceMetadata; 245] = [
     ServiceMetadata {
         library: "kernel32.dll",
         symbol: "SetProcessPriorityBoost",
@@ -1350,6 +1350,17 @@ pub static SERVICES: [ServiceMetadata; 244] = [
         failure: "-1 with errno EINVAL or ENOENT; the times answer -1 because the drive has no time stamps",
         reference: "corecrt_wio.h _wstat64i32, _mingw_stat64.h struct _stat64i32",
         tests: &["the_wide_file_operations_follow_the_drive"],
+    },
+    ServiceMetadata {
+        library: "ucrtbase.dll",
+        symbol: "_assert",
+        parameters: &[Parameter { name: "expression", kind: "ptr" }, Parameter { name: "file", kind: "ptr" }, Parameter { name: "line", kind: "u32" }],
+        result: "void",
+        status: ServiceStatus::Partial,
+        aliases: &["api-ms-win-crt-runtime-l1-1-0.dll"],
+        failure: "nothing; the message prints on stderr and the process ends with status 3, since no signal handler can exist here",
+        reference: "assert.h _assert",
+        tests: &["an_assertion_prints_and_ends_the_process"],
     },
     ServiceMetadata {
         library: "ucrtbase.dll",
@@ -3849,6 +3860,16 @@ pub fn register(registry: &mut ImportRegistry, state: &Arc<ServicesState>) {
         let mut context = ServiceContext { state: &s, memory, teb: cpu.gs_base };
         let result: i32 = handlers::_wstat64i32(&mut context, a0, a1)?;
         Ok(result.place(cpu))
+    });
+    let s = state.clone();
+    registry.register_with_status("ucrtbase.dll", "_assert", ServiceStatus::Partial, move |args, cpu, memory| {
+        let call = Call::new(args, cpu, memory);
+        let a0 = call.u64(0)?;
+        let a1 = call.u64(1)?;
+        let a2 = call.u32(2)?;
+        let mut context = ServiceContext { state: &s, memory, teb: cpu.gs_base };
+        let () = handlers::_assert(&mut context, a0, a1, a2)?;
+        Ok(0)
     });
     let s = state.clone();
     registry.register_with_status("ucrtbase.dll", "_beginthreadex", ServiceStatus::Partial, move |args, cpu, memory| {

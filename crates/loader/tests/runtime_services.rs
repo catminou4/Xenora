@@ -7425,6 +7425,8 @@ fn place_wide(guest: &mut Guest, at: u64, text: &str) -> u64 {
         guest.memory.write_u16(at + index as u64 * 2, unit).unwrap();
     }
     at
+||||||| parent of 0fab6c8a (loader: _assert prints its message and ends the process)
+>>>>>>> 0fab6c8a (loader: _assert prints its message and ends the process)
 fn the_wide_file_operations_follow_the_drive() {
     let (mut guest, _streams) = stdio_guest();
     // _wfopen opens the same files as fopen, with a wide name and mode.
@@ -7495,3 +7497,18 @@ fn beginthreadex_starts_a_thread_like_createthread() {
     // with _beginthreadex writes the shared memory the main thread reads
     // after waiting on its handle.
 >>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)
+||||||| parent of 0fab6c8a (loader: _assert prints its message and ends the process)
+}
+#[test]
+fn an_assertion_prints_and_ends_the_process() {
+    let (mut guest, _) = stdio_guest();
+    let expression = place(&mut guest, NAME, b"x == 42");
+    let file = place(&mut guest, MODE, b"sqlite3.c");
+    let (_, exit) = guest.run("_assert", &[expression, file, 1337]);
+    assert_eq!(exit, xenora_loader::cpu::ExitReason::ProcessExit(3));
+    // stderr is the third captured stream: the message went there.
+    assert_eq!(
+        guest.state.standard_error(),
+        b"Assertion failed: x == 42, file sqlite3.c, line 1337\r\n"
+    );
+>>>>>>> 0fab6c8a (loader: _assert prints its message and ends the process)

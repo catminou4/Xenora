@@ -1894,6 +1894,17 @@ pub(crate) mod handlers {
         or_errno(context, outcome)
     }
 
+    pub fn _assert(
+        context: &mut ServiceContext<'_>,
+        expression: u64,
+        file: u64,
+        line: u32,
+    ) -> Outcome<()> {
+        let mut streams = context.state.crt_streams();
+        let mut drive = context.state.objects.lock().expect("guest object state");
+        streams.assert_failure(context.memory, &mut drive, expression, file, line)
+    }
+
     /// `_beginthreadex`: the CRT spelling of CreateThread. The answer is the
     /// handle itself, with 0 and an errno for a failure instead of the
     /// kernel32 INVALID_HANDLE_VALUE and last error. The CRT passes the
