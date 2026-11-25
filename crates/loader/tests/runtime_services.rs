@@ -7474,3 +7474,24 @@ fn the_wide_file_operations_follow_the_drive() {
         guest.call("_access", &[dir_narrow, 8]) & 0xFFFF_FFFF,
     assert_eq!(guest.errno(), 22);
 >>>>>>> 503bc17b (loader: the CRT wide file operations sqlite3 uses)
+||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
+}
+#[test]
+fn beginthreadex_starts_a_thread_like_createthread() {
+    let mut guest = stdio_guest().0;
+    // The CRT form refuses what CreateThread refuses: security descriptors,
+    // unknown flags and a null start, with EINVAL instead of a last error.
+    let start = TEXT; // any non-null guest address
+    assert_eq!(guest.call("_beginthreadex", &[1, 0, start, 0]), 0);
+    assert_eq!(guest.errno(), 22);
+    assert_eq!(guest.call("_beginthreadex", &[0, 0, 0, 0]), 0);
+    guest.memory.write_u64(STACK_TOP + 32, 8).unwrap(); // unknown initflag bit
+    assert_eq!(guest.call("_beginthreadex", &[0, 0, start, 0]), 0);
+    // Without an attached scheduler the machine has no threads: ENOMEM.
+    guest.memory.write_u64(STACK_TOP + 32, 0).unwrap();
+    assert_eq!(guest.errno(), 12);
+    // Thread creation itself is proven end to end by the hosted fixture:
+    // `xenora run` attaches the scheduler, and a thread the fixture starts
+    // with _beginthreadex writes the shared memory the main thread reads
+    // after waiting on its handle.
+>>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)

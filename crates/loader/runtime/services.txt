@@ -1072,6 +1072,22 @@ service ucrtbase.dll _wstat64i32(name: ptr, output: ptr) -> i32
     ref corecrt_wio.h _wstat64i32, _mingw_stat64.h struct _stat64i32
     test the_wide_file_operations_follow_the_drive
 
+service ucrtbase.dll _beginthreadex(security: ptr, stack_size: u64, start: ptr, arglist: ptr, initflag: u32, thrdaddr: ptr) -> ptr
+    handler _beginthreadex
+    status partial
+    alias api-ms-win-crt-runtime-l1-1-0.dll
+    fails 0 with errno EINVAL for a security descriptor, unknown flags or a null start, ENOMEM when the machine has no room or no scheduler
+    ref corecrt_startup.h _beginthreadex; the thread services of the scheduler
+    test beginthreadex_starts_a_thread_like_createthread
+
+service ucrtbase.dll _endthreadex(code: u32) -> void
+    handler _endthreadex
+    status partial
+    alias api-ms-win-crt-runtime-l1-1-0.dll
+    fails nothing; the thread ends with the code as its exit code
+    ref corecrt_startup.h _endthreadex
+    test beginthreadex_starts_a_thread_like_createthread
+
 service ucrtbase.dll perror(message: ptr) -> void
     handler perror
     status partial

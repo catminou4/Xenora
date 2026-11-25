@@ -44,6 +44,16 @@ static BOOL unlock_ex(HANDLE file, DWORD offset, DWORD length) {
     return UnlockFileEx(file, 0, length, 0, &overlapped);
 }
 
+static volatile unsigned worker_done;
+static volatile unsigned worker_value;
+
+static unsigned __stdcall beginthread_worker(void *argument) {
+    worker_value = argument == (void *)0xfeed ? 77 : 0;
+    worker_done = 1;
+    _endthreadex(42);
+    return 0; /* not reached */
+}
+
 int main(void) {
     const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
     HANDLE first = CreateFileW(L"C:\\locks.db", GENERIC_READ | GENERIC_WRITE, share, NULL,
@@ -164,6 +174,23 @@ int main(void) {
     CHECK("file inside new directory", inner != NULL && fclose(inner) == 0);
     CHECK("wmkdir missing parent fails", _wmkdir(L"c:\\nope\\dir") == -1);
     CHECK("wunlink inner", _wunlink(L"c:\\wdir\\in.txt") == 0);
+
+    // sqlite runs its background work through CRT threads: _beginthreadex is
+    // the CRT spelling of CreateThread, and _endthreadex the one of ExitThread.
+    uintptr_t thread = _beginthreadex(NULL, 0, beginthread_worker, (void *)0xfeed, 0, NULL);
+    CHECK("beginthreadex creates", thread != 0);
+    if (thread) {
+        CHECK("wait for the worker", WaitForSingleObject((HANDLE)thread, INFINITE) == WAIT_OBJECT_0);
+        DWORD exit_code = 0;
+        CHECK("worker exit code",
+              GetExitCodeThread((HANDLE)thread, &exit_code) && exit_code == 42);
+        CloseHandle((HANDLE)thread);
+    }
+    CHECK("worker wrote shared memory", worker_done == 1 && worker_value == 77);
+
+    errno = 0;
+    CHECK("beginthreadex null start fails",
+          _beginthreadex(NULL, 0, NULL, NULL, 0, NULL) == 0 && errno == EINVAL);
 
 #ifdef CRT_WINLOCKS_BREAK
     CHECK("the control fails", sectors == 999);

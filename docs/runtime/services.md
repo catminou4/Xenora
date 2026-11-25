@@ -6,14 +6,36 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 
 | Measure | Count |
 | --- | ---: |
+<<<<<<< HEAD
 | Services with a declared ABI | 242 |
 | Generated adapters | 242 |
 | Unique handler implementations | 233 |
 | Implemented | 86 |
 | Partial | 154 |
+||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
+| Services with a declared ABI | 242 |
+| Generated adapters | 242 |
+| Unique handler implementations | 232 |
+| Implemented | 78 |
+| Partial | 162 |
+=======
+| Services with a declared ABI | 244 |
+| Generated adapters | 244 |
+| Unique handler implementations | 234 |
+| Implemented | 78 |
+| Partial | 164 |
+>>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)
 | Stub | 2 |
+<<<<<<< HEAD
 | Conformance-tested through guest dispatch | 242 |
 | API-set aliases (not services) | 292 |
+||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
+| Conformance-tested through guest dispatch | 242 |
+| API-set aliases (not services) | 286 |
+=======
+| Conformance-tested through guest dispatch | 244 |
+| API-set aliases (not services) | 288 |
+>>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)
 | Independently accepted | 0 |
 
 | Service | Signature | Status | Failure |
@@ -134,6 +156,28 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `ucrtbase.dll!_wcsnicmp` | `(first: ptr, second: ptr, count: u64) -> i32` | implemented | never; the folding is the ASCII one of the C locale, the only locale modelled, and the answer is -1, 0 or 1 as the sign-only contract permits |
 | `ucrtbase.dll!_wcsdup` | `(text: ptr) -> ptr` | implemented | null when the copy cannot be allocated |
 | `ucrtbase.dll!_strdup` | `(text: ptr) -> ptr` | partial | a string longer than 65536 bytes or an allocation failure answers null; errno is not set |
+<<<<<<< HEAD
+||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
+| `ucrtbase.dll!_wfopen` | `(name: ptr, mode: ptr) -> ptr` | partial | null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM |
+| `ucrtbase.dll!_unlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
+| `ucrtbase.dll!_wunlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
+| `ucrtbase.dll!_access` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
+| `ucrtbase.dll!_waccess` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
+| `ucrtbase.dll!_wmkdir` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT, ENOSPC or EACCES when the name is taken |
+| `ucrtbase.dll!_wchmod` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL or ENOENT |
+| `ucrtbase.dll!_wstat64i32` | `(name: ptr, output: ptr) -> i32` | partial | -1 with errno EINVAL or ENOENT; the times answer -1 because the drive has no time stamps |
+=======
+| `ucrtbase.dll!_wfopen` | `(name: ptr, mode: ptr) -> ptr` | partial | null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM |
+| `ucrtbase.dll!_unlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
+| `ucrtbase.dll!_wunlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
+| `ucrtbase.dll!_access` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
+| `ucrtbase.dll!_waccess` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
+| `ucrtbase.dll!_wmkdir` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT, ENOSPC or EACCES when the name is taken |
+| `ucrtbase.dll!_wchmod` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL or ENOENT |
+| `ucrtbase.dll!_wstat64i32` | `(name: ptr, output: ptr) -> i32` | partial | -1 with errno EINVAL or ENOENT; the times answer -1 because the drive has no time stamps |
+| `ucrtbase.dll!_beginthreadex` | `(security: ptr, stack_size: u64, start: ptr, arglist: ptr, initflag: u32, thrdaddr: ptr) -> ptr` | partial | 0 with errno EINVAL for a security descriptor, unknown flags or a null start, ENOMEM when the machine has no room or no scheduler |
+| `ucrtbase.dll!_endthreadex` | `(code: u32) -> void` | partial | nothing; the thread ends with the code as its exit code |
+>>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)
 | `ucrtbase.dll!perror` | `(message: ptr) -> void` | partial | never |
 | `ucrtbase.dll!putc` | `(character: i32, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |
 | `ucrtbase.dll!fputc` | `(character: i32, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |

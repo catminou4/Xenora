@@ -1894,6 +1894,68 @@ pub(crate) mod handlers {
         or_errno(context, outcome)
     }
 
+    /// `_beginthreadex`: the CRT spelling of CreateThread. The answer is the
+    /// handle itself, with 0 and an errno for a failure instead of the
+    /// kernel32 INVALID_HANDLE_VALUE and last error. The CRT passes the
+    /// security attributes through, so they are refused exactly as
+    /// CreateThread refuses them; the errno mapping is EINVAL for the
+    /// arguments and the environment, ENOMEM for the machine having no room.
+    pub fn _beginthreadex(
+        context: &mut ServiceContext<'_>,
+        security: u64,
+        stack_size: u64,
+        start: u64,
+        arglist: u64,
+        initflag: u32,
+        thrdaddr: u64,
+    ) -> Outcome<u64> {
+        use crate::services::crt_files::{EINVAL, ENOMEM};
+        fn failure(context: &mut ServiceContext<'_>, errno: u32) -> Result<u64, ExitReason> {
+            crt::set_errno(context.memory, context.teb, errno)?;
+            Ok(0)
+        }
+        if security != 0
+            || initflag & !(threads::CREATE_SUSPENDED | threads::STACK_SIZE_PARAM_IS_A_RESERVATION)
+                != 0
+            || start == 0
+        {
+            return failure(context, EINVAL);
+        }
+        if !context.state.hooks.is_attached() {
+            return failure(context, ENOMEM);
+        }
+        let request = threads::ThreadRequest {
+            stack: stack_size,
+            start,
+            parameter: arglist,
+            suspended: initflag & threads::CREATE_SUSPENDED != 0,
+            reservation: initflag & threads::STACK_SIZE_PARAM_IS_A_RESERVATION != 0,
+            id_output: thrdaddr,
+        };
+        let handle = context
+            .state
+            .create_thread(context.teb, context.memory, &request)?;
+        if handle != 0 {
+            return Ok(handle);
+        }
+        let errno = match context.state.last_error(context.teb) {
+            8 => ENOMEM,
+            _ => EINVAL,
+        };
+        failure(context, errno)
+    }
+
+    /// `_endthreadex`: the CRT spelling of ExitThread. Unlike `_endthread` it
+    /// does not close the thread's handle, which is exactly what the kernel32
+    /// service does not do either, so the two share their semantics.
+    pub fn _endthreadex(context: &mut ServiceContext<'_>, code: u32) -> Outcome<()> {
+        let mut table = context.state.threads.lock().expect("guest thread table");
+        let Some(id) = table.id_of(context.teb) else {
+            return Err(ExitReason::IllegalInstruction(0xFE));
+        };
+        table.threads.get_mut(&id).expect("thread found above").exit = Some(code);
+        Err(ExitReason::GuestThreadExited)
+    }
 
     /// `_mkdir` and `_rmdir` are drive operations the descriptor layer is no
     /// part of: the narrow path resolves as every drive path does.
