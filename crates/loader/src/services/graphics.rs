@@ -455,7 +455,7 @@ fn xenora_create_texture2d(
     let format = args.get(3, memory).map_err(ExitReason::MemoryFault)? as u32;
     let guest_addr = args.get(4, memory).map_err(ExitReason::MemoryFault)?;
     let out = args.get(5, memory).map_err(ExitReason::MemoryFault)?;
-    if out == 0 || format != DXGI_FORMAT_R8G8B8A8_UNORM {
+    if out == 0 || !writable_out(memory, out) || format != DXGI_FORMAT_R8G8B8A8_UNORM {
         return Ok(invalid_arg());
     }
     let mut graphics = lock_graphics(state)?;
@@ -493,7 +493,10 @@ fn xenora_create_descriptor_heap(
     let heap_type = args.get(1, memory).map_err(ExitReason::MemoryFault)? as u32;
     let num_descriptors = args.get(2, memory).map_err(ExitReason::MemoryFault)? as u32;
     let out = args.get(3, memory).map_err(ExitReason::MemoryFault)?;
-    if out == 0 || !matches!(heap_type, HEAP_TYPE_CBV_SRV_UAV | HEAP_TYPE_SAMPLER) {
+    if out == 0
+        || !writable_out(memory, out)
+        || !matches!(heap_type, HEAP_TYPE_CBV_SRV_UAV | HEAP_TYPE_SAMPLER)
+    {
         return Ok(invalid_arg());
     }
     let mut graphics = lock_graphics(state)?;
@@ -510,6 +513,9 @@ fn xenora_create_descriptor_heap(
         Ok(heap) => heap,
         Err(error) => return Ok(binding_hresult(&error)),
     };
+    if memory.write_u64(out, heap.to_u64()).is_err() {
+        return Ok(invalid_arg());
+    }
     remember_heap(
         state,
         heap,
@@ -519,9 +525,6 @@ fn xenora_create_descriptor_heap(
             device: creator.unwrap_or(0),
         },
     );
-    if memory.write_u64(out, heap.to_u64()).is_err() {
-        return Ok(invalid_arg());
-    }
     Ok(ok())
 }
 
@@ -643,7 +646,11 @@ fn xenora_create_root_signature(
     let srv_parameter = args.get(1, memory).map_err(ExitReason::MemoryFault)? as u32;
     let sampler_parameter = args.get(2, memory).map_err(ExitReason::MemoryFault)? as u32;
     let out = args.get(3, memory).map_err(ExitReason::MemoryFault)?;
-    if out == 0 || srv_parameter == sampler_parameter || srv_parameter > 1 || sampler_parameter > 1
+    if out == 0
+        || !writable_out(memory, out)
+        || srv_parameter == sampler_parameter
+        || srv_parameter > 1
+        || sampler_parameter > 1
     {
         return Ok(invalid_arg());
     }
@@ -1488,6 +1495,100 @@ mod tests {
                 "out pointer {out:#x} allocated"
             );
         }
+    }
+
+    #[test]
+    fn texture_creation_with_unwritable_handle_outputs_is_transactional() {
+        check_binding_creator_outputs(|state, device, out, memory| {
+            let args = call_args(
+                memory,
+                device,
+                2,
+                2,
+                u64::from(DXGI_FORMAT_R8G8B8A8_UNORM),
+                &[TEXTURE_ADDRESS, out],
+            );
+            xenora_create_texture2d(state, &args, memory)
+        });
+    }
+
+    #[test]
+    fn heap_creation_with_unwritable_handle_outputs_is_transactional() {
+        check_binding_creator_outputs(|state, device, out, memory| {
+            let args = call_args(
+                memory,
+                device,
+                u64::from(HEAP_TYPE_CBV_SRV_UAV),
+                1,
+                out,
+                &[],
+            );
+            xenora_create_descriptor_heap(state, &args, memory)
+        });
+    }
+
+    #[test]
+    fn root_signature_creation_with_unwritable_handle_outputs_is_transactional() {
+        check_binding_creator_outputs(|state, device, out, memory| {
+            let args = call_args(memory, device, 0, 1, out, &[]);
+            xenora_create_root_signature(state, &args, memory)
+        });
+    }
+
+    fn check_binding_creator_outputs(
+        create: impl Fn(&Arc<ServicesState>, u64, u64, &mut GuestMemory) -> Result<u64, ExitReason>,
+    ) {
+        let state = state();
+        let mut memory = memory();
+        memory
+            .map_region(
+                READ_ONLY_ADDRESS - 0x1000,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+            )
+            .expect("writable page adjacent to the read-only page");
+        let partial_outputs = [HANDLE_SLOT + 0x1000 - 4, READ_ONLY_ADDRESS - 4];
+        let marker = 0x1234_5678;
+        for out in partial_outputs {
+            memory.write_u32(out, marker).expect("writable prefix");
+        }
+
+        for out in [0, READ_ONLY_ADDRESS, UNMAPPED_ADDRESS, u64::MAX - 3]
+            .into_iter()
+            .chain(partial_outputs)
+        {
+            let device = create_device_handle(&state, &mut memory);
+            assert_eq!(
+                create(&state, device, out, &mut memory).expect("service call succeeds"),
+                E_INVALIDARG_HRESULT,
+                "out pointer {out:#x}"
+            );
+            if partial_outputs.contains(&out) {
+                assert_eq!(memory.read_u32(out).expect("writable prefix"), marker);
+            }
+            let args = call_args(&mut memory, device, 0, 0, 0, &[]);
+            assert_eq!(
+                xenora_destroy_device(&state, &args, &mut memory).expect("service call succeeds"),
+                ok(),
+                "rejected out pointer {out:#x} left a live child"
+            );
+        }
+
+        memory
+            .map_region(HANDLE_SLOT + 0x1000, 0x1000, MemoryPermissions::READ_WRITE)
+            .expect("second writable handle page");
+        let out = partial_outputs[0];
+        let device = create_device_handle(&state, &mut memory);
+        memory
+            .write_u64(out, u64::MAX)
+            .expect("split writable output");
+        assert_eq!(
+            create(&state, device, out, &mut memory).expect("service call succeeds"),
+            ok()
+        );
+        let handle = memory.read_u64(out).expect("published graphics handle");
+        assert_ne!(handle, 0);
+        assert_ne!(handle, u64::MAX);
     }
 
     #[test]

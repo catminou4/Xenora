@@ -35,6 +35,10 @@ handle of a destroyed object never resolves to a new object that reuses its
 slot. Zero is not a valid handle. The guest passes a handle back exactly as it
 received it; a handle is never a host pointer.
 
+Creation exports that return an object handle require a non-null pointer to
+eight writable guest bytes. They return `E_INVALIDARG` for an invalid output
+before creating the object.
+
 | Export | Arguments (Win64 order) | Effect |
 | --- | --- | --- |
 | `XenoraCreateDevice` | `ppDevice` | Creates a device and writes its handle to `*ppDevice`. |
