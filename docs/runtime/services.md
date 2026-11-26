@@ -6,51 +6,14 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 
 | Measure | Count |
 | --- | ---: |
-<<<<<<< HEAD
-| Services with a declared ABI | 242 |
-| Generated adapters | 242 |
-| Unique handler implementations | 233 |
-| Implemented | 86 |
-| Partial | 154 |
-||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
-| Services with a declared ABI | 242 |
-| Generated adapters | 242 |
-| Unique handler implementations | 232 |
-| Implemented | 78 |
-| Partial | 162 |
-| Services with a declared ABI | 244 |
-| Generated adapters | 244 |
-| Unique handler implementations | 234 |
-||||||| parent of 0fab6c8a (loader: _assert prints its message and ends the process)
-| Services with a declared ABI | 244 |
-| Generated adapters | 244 |
-| Unique handler implementations | 234 |
-=======
-| Services with a declared ABI | 245 |
-| Generated adapters | 245 |
-| Unique handler implementations | 235 |
->>>>>>> 0fab6c8a (loader: _assert prints its message and ends the process)| Implemented | 78 |
-| Partial | 164 |
->>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)
-||||||| parent of 0fab6c8a (loader: _assert prints its message and ends the process)
-| Partial | 164 |
+| Services with a declared ABI | 251 |
+| Generated adapters | 251 |
+| Unique handler implementations | 242 |
+| Implemented | 84 |
 | Partial | 165 |
->>>>>>> 0fab6c8a (loader: _assert prints its message and ends the process)| Stub | 2 |
-<<<<<<< HEAD
-| Conformance-tested through guest dispatch | 242 |
-| API-set aliases (not services) | 292 |
-||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
-| Conformance-tested through guest dispatch | 242 |
-| API-set aliases (not services) | 286 |
-| Conformance-tested through guest dispatch | 244 |
-| API-set aliases (not services) | 288 |
->>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)||||||| parent of 0fab6c8a (loader: _assert prints its message and ends the process)
-| Conformance-tested through guest dispatch | 244 |
-| API-set aliases (not services) | 288 |
-=======
-| Conformance-tested through guest dispatch | 245 |
-| API-set aliases (not services) | 289 |
->>>>>>> 0fab6c8a (loader: _assert prints its message and ends the process)
+| Stub | 2 |
+| Conformance-tested through guest dispatch | 251 |
+| API-set aliases (not services) | 299 |
 | Independently accepted | 0 |
 
 | Service | Signature | Status | Failure |
@@ -131,8 +94,6 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `ucrtbase.dll!_mkdir` | `(name: ptr) -> i32` | implemented | -1 with errno ENOENT when the parent does not exist, EEXIST when the name is taken, ENOSPC at 256 directories |
 | `ucrtbase.dll!_rmdir` | `(name: ptr) -> i32` | implemented | -1 with errno ENOENT for a missing directory, EEXIST for one still holding files or directories |
 | `ucrtbase.dll!_pipe` | `(fds: ptr, size: u32, mode: i32) -> i32` | partial | a read of an empty pipe whose write end is open stops the guest — blocking is not modelled; the size and mode arguments do not act |
-| `ucrtbase.dll!_access` | `(name: ptr, mode: i32) -> i32` | implemented | -1 with errno ENOENT for a missing or rejected name, EINVAL for a null or empty name or mode bits other than 0, 2, 4 and 6 |
-| `ucrtbase.dll!_unlink` | `(name: ptr) -> i32` | implemented | -1 with errno ENOENT missing, EACCES for a directory, EINVAL for a null or empty name; it is remove by another name |
 | `ucrtbase.dll!_gmtime64` | `(time: ptr) -> ptr` | implemented | null with errno EINVAL for a null pointer or a time outside 1970-to-3000 |
 | `ucrtbase.dll!_localtime64` | `(time: ptr) -> ptr` | implemented | null with errno EINVAL for a null pointer or a time outside 1970-to-3000 |
 | `ucrtbase.dll!_mktime64` | `(tm: ptr) -> ptr` | implemented | -1 with errno EINVAL for a null pointer or a time outside 1970-to-3000 |
@@ -171,15 +132,6 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `ucrtbase.dll!_wcsnicmp` | `(first: ptr, second: ptr, count: u64) -> i32` | implemented | never; the folding is the ASCII one of the C locale, the only locale modelled, and the answer is -1, 0 or 1 as the sign-only contract permits |
 | `ucrtbase.dll!_wcsdup` | `(text: ptr) -> ptr` | implemented | null when the copy cannot be allocated |
 | `ucrtbase.dll!_strdup` | `(text: ptr) -> ptr` | partial | a string longer than 65536 bytes or an allocation failure answers null; errno is not set |
-||||||| parent of a9c75562 (loader: CRT thread creation through the scheduler)
-| `ucrtbase.dll!_wfopen` | `(name: ptr, mode: ptr) -> ptr` | partial | null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM |
-| `ucrtbase.dll!_unlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
-| `ucrtbase.dll!_wunlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
-| `ucrtbase.dll!_access` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
-| `ucrtbase.dll!_waccess` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a write mode on a read-only file |
-| `ucrtbase.dll!_wmkdir` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT, ENOSPC or EACCES when the name is taken |
-| `ucrtbase.dll!_wchmod` | `(name: ptr, mode: i32) -> i32` | partial | -1 with errno EINVAL or ENOENT |
-| `ucrtbase.dll!_wstat64i32` | `(name: ptr, output: ptr) -> i32` | partial | -1 with errno EINVAL or ENOENT; the times answer -1 because the drive has no time stamps |
 | `ucrtbase.dll!_wfopen` | `(name: ptr, mode: ptr) -> ptr` | partial | null with errno EINVAL, ENOENT, EACCES, EMFILE, ENOSPC or ENOMEM |
 | `ucrtbase.dll!_unlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
 | `ucrtbase.dll!_wunlink` | `(name: ptr) -> i32` | partial | -1 with errno EINVAL, ENOENT or EACCES for a directory or a read-only file |
@@ -191,7 +143,7 @@ A declared service is not a claim of compatibility. `implemented` and `partial` 
 | `ucrtbase.dll!_assert` | `(expression: ptr, file: ptr, line: u32) -> void` | partial | nothing; the message prints on stderr and the process ends with status 3, since no signal handler can exist here |
 | `ucrtbase.dll!_beginthreadex` | `(security: ptr, stack_size: u64, start: ptr, arglist: ptr, initflag: u32, thrdaddr: ptr) -> ptr` | partial | 0 with errno EINVAL for a security descriptor, unknown flags or a null start, ENOMEM when the machine has no room or no scheduler |
 | `ucrtbase.dll!_endthreadex` | `(code: u32) -> void` | partial | nothing; the thread ends with the code as its exit code |
->>>>>>> a9c75562 (loader: CRT thread creation through the scheduler)| `ucrtbase.dll!perror` | `(message: ptr) -> void` | partial | never |
+| `ucrtbase.dll!perror` | `(message: ptr) -> void` | partial | never |
 | `ucrtbase.dll!putc` | `(character: i32, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |
 | `ucrtbase.dll!fputc` | `(character: i32, stream: ptr) -> i32` | partial | EOF with errno EINVAL for a null stream, or EBADF or ENOSPC for a file; stops the guest for stdin or a pointer that is no stream |
 | `ucrtbase.dll!strerror` | `(code: i32) -> ptr` | partial | never; the message is valid until the next call |
