@@ -67,6 +67,10 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 - [Application fixture runner](../scripts/compat/README.md) — Run selected original fixture tests and compare their recorded outcomes.
 - [Mutation testing](testing/mutation.md) and [benchmark protocol](testing/benchmarks.md) — Test sensitivity, benchmark inputs, and timing requirements.
 
+## Middleware and platform services
+
+- [Middleware compatibility](middleware/README.md) and [Campaign E coverage](middleware/coverage.md) — Public-interface inventory, implementation states, licensing boundaries and validation requirements for networking, FidelityFX research, Metal acceleration structures and video playback.
+
 ## Research and engineering decisions
 
 - [Public sources](research/sources.md), [RDNA 2 notes](research/rdna2.md), and [Xbox GPU evidence](research/xbox-gpu.md) — Specifications, evidence scope, and unknown console behavior.
