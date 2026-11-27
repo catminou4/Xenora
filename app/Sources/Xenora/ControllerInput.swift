@@ -125,22 +125,18 @@ struct DetectedController: Equatable {
     }
 }
 
-@MainActor
 func pollGameController() -> DetectedController? {
     pollGameController(current: GCController.current, controllers: GCController.controllers())
 }
 
-@MainActor
 func pollGameControllers() -> [DetectedController] {
     pollGameControllers(current: GCController.current, controllers: GCController.controllers())
 }
 
-@MainActor
 func pollGameController(current: GCController?, controllers: [GCController]) -> DetectedController? {
     pollGameControllers(current: current, controllers: controllers).first
 }
 
-@MainActor
 func pollGameControllers(current: GCController?, controllers: [GCController]) -> [DetectedController] {
     var ordered: [GCController] = []
     func appendPlayable(_ controller: GCController) {
@@ -158,7 +154,6 @@ func pollGameControllers(current: GCController?, controllers: [GCController]) ->
     return ordered.prefix(4).compactMap(detectController)
 }
 
-@MainActor
 private func detectController(_ controller: GCController) -> DetectedController? {
     let captured = controller.capture()
     let snapshot: ControllerSnapshot
@@ -191,7 +186,6 @@ private func detectController(_ controller: GCController) -> DetectedController?
     )
 }
 
-@MainActor
 private func extendedXInputSnapshot(_ pad: GCExtendedGamepad) -> XInputSnapshotValues {
     var buttons = xinputDirectionalButtons(pad.dpad)
     if pad.buttonMenu.isPressed { buttons |= XInputButtonBits.start }
@@ -216,7 +210,6 @@ private func extendedXInputSnapshot(_ pad: GCExtendedGamepad) -> XInputSnapshotV
     )
 }
 
-@MainActor
 private func microXInputSnapshot(_ pad: GCMicroGamepad) -> XInputSnapshotValues {
     var buttons = xinputDirectionalButtons(pad.dpad)
     if pad.buttonMenu.isPressed { buttons |= XInputButtonBits.start }
@@ -225,7 +218,6 @@ private func microXInputSnapshot(_ pad: GCMicroGamepad) -> XInputSnapshotValues 
     return XInputSnapshotValues(buttons: buttons)
 }
 
-@MainActor
 private func xinputDirectionalButtons(_ pad: GCControllerDirectionPad) -> UInt16 {
     var buttons: UInt16 = 0
     if pad.right.isPressed { buttons |= XInputButtonBits.dpadRight }
@@ -235,7 +227,6 @@ private func xinputDirectionalButtons(_ pad: GCControllerDirectionPad) -> UInt16
     return buttons
 }
 
-@MainActor
 private func directionalButtons(_ pad: GCControllerDirectionPad) -> UInt32 {
     var buttons: UInt32 = 0
     if pad.right.isPressed { buttons |= UInt32(XENORA_INPUT_RIGHT) }
