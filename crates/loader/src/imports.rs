@@ -275,17 +275,12 @@ fn callback_depth(memory: &GuestMemory, teb: u64) -> usize {
         .count()
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct GuestCallback {
     pub(crate) entry: u64,
     pub(crate) context: u64,
     pub(crate) cancelled: bool,
 }
-
-type CallbackDispatch = Box<
-    dyn Fn(&Win64Args, u64, &GuestMemory) -> Result<Option<GuestCallback>, ExitReason>
-        + Send
-        + Sync,
->;
 
 /// What a callback-driven service does next.
 pub(crate) enum CallbackStep {
@@ -348,7 +343,6 @@ pub struct ImportRegistry {
     // (lower-case module, name) -> service index. Symbol names keep their case.
     services: HashMap<(String, ImportName), usize>,
     handlers: Vec<ServiceDescriptor>,
-    callback_dispatchers: HashMap<usize, CallbackDispatch>,
     callback_tasks: HashMap<usize, TaskStart>,
     /// Services that set the whole CPU state themselves, such as exception
     /// dispatch entering a guest handler or installing an unwind target.
@@ -376,7 +370,6 @@ impl ImportRegistry {
             hooks: None,
             services: HashMap::new(),
             handlers: Vec::new(),
-            callback_dispatchers: HashMap::new(),
             callback_tasks: HashMap::new(),
             context_services: Default::default(),
             data_providers: HashMap::new(),
@@ -803,24 +796,6 @@ impl ImportRegistry {
         Ok(slots.len())
     }
 
-    pub(crate) fn register_callback_dispatch(
-        &mut self,
-        module: &str,
-        symbol: &str,
-        handler: impl Fn(&Win64Args, u64, &GuestMemory) -> Result<Option<GuestCallback>, ExitReason>
-        + Send
-        + Sync
-        + 'static,
-    ) {
-        self.register_with_status(module, symbol, ServiceStatus::Partial, |_, _, _| {
-            Err(ExitReason::IllegalInstruction(0xff))
-        });
-        let index = self
-            .service_index(module, symbol)
-            .expect("registered dispatcher");
-        self.callback_dispatchers.insert(index, Box::new(handler));
-    }
-
     /// Register a service that may call guest code before returning. `start`
     /// receives the arguments, the caller's TEB, guest memory and the address
     /// of the service's 16-byte stack scratch area.
@@ -1036,41 +1011,6 @@ impl ImportRegistry {
                     self.enter_task_callback(cpu, memory, frame, slot, entry, args)?;
                 }
             }
-            return Ok(());
-        }
-        if let Some(dispatcher) = self.callback_dispatchers.get(&service_idx) {
-            let key = (cpu.gs_base, after);
-            if callback_depth(memory, cpu.gs_base) >= MAX_CALLBACK_DEPTH
-                || memory.callback_frames.contains_key(&key)
-            {
-                return Err(ExitReason::ServiceAbiViolation);
-            }
-            memory
-                .check_write(rsp, 8)
-                .map_err(ExitReason::MemoryFault)?;
-            if let Some(callback) = dispatcher(&args, cpu.gs_base, memory)? {
-                memory
-                    .write_u64(rsp, CALLBACK_RETURN)
-                    .map_err(ExitReason::MemoryFault)?;
-                let mut preserved = preserved;
-                preserved.gpr[4] = after;
-                memory.callback_frames.insert(
-                    key,
-                    CallbackFrame {
-                        resume: ret_addr,
-                        preserved,
-                        task: None,
-                        after,
-                    },
-                );
-                cpu.set(Register::Rcx, callback.context);
-                cpu.set(Register::Rdx, u64::from(callback.cancelled));
-                cpu.rip = callback.entry;
-                return Ok(());
-            }
-            cpu.set(Register::Rax, 0);
-            cpu.set(Register::Rsp, after);
-            cpu.rip = ret_addr;
             return Ok(());
         }
         let value = (descriptor.handler)(&args, cpu, memory)?;

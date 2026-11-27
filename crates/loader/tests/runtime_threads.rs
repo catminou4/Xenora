@@ -1383,6 +1383,46 @@ fn work_submitted_after_a_task_queue_deadline_stays_queued() {
 }
 
 #[test]
+fn task_queue_termination_orders_ports_and_completion_callback() {
+    for quantum in [64, 1024, 1_000_000] {
+        let run = run_with("main_tq_termination_order", quantum, BUDGET).halted();
+        // Creation/submission/termination succeeded; the first completion poll is
+        // gated, then work, completion and termination callbacks dispatch once.
+        assert_eq!(
+            run.outs(9),
+            [1, 1, 1, 1, 0, 1, 1, 1, 0],
+            "quantum {quantum}"
+        );
+        let low = |index| run.out(index) & 0xffff_ffff;
+        assert_eq!((low(20), low(21), low(22)), (1, 2, 3), "quantum {quantum}");
+        assert_eq!(run.out(20) >> 32, 1, "work cancellation");
+        assert_eq!(run.out(21) >> 32, 1, "completion cancellation");
+    }
+}
+
+#[test]
+fn synchronous_task_queue_termination_waits_for_callback_return() {
+    for quantum in [64, 1024, 1_000_000] {
+        let run = run_with("main_tq_termination_wait", quantum, BUDGET).halted();
+        assert_eq!(run.outs(6), [1, 1, 1, 1, 3, 3], "quantum {quantum}");
+    }
+}
+
+#[test]
+fn task_queue_termination_follows_queue_object_ownership() {
+    for quantum in [64, 1024, 1_000_000] {
+        let run = run_with("main_tq_termination_owner_scope", quantum, BUDGET).halted();
+        assert_eq!(
+            run.outs(11),
+            [1, 1, 1, 1, 0x8000_4004, 1, 0, 1, 1, 1, 1],
+            "quantum {quantum}"
+        );
+        assert_eq!(run.out(20) >> 32, 1, "duplicate handle cancellation");
+        assert_eq!(run.out(21) >> 32, 0, "composite remains independent");
+    }
+}
+
+#[test]
 fn delayed_task_queue_work_uses_the_scheduler_clock() {
     for quantum in [64, 1024, 1_000_000] {
         let run = run_with("main_tq_delayed_infinite", quantum, BUDGET).halted();
