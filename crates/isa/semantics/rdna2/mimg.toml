@@ -1,0 +1,55 @@
+# MIMG image sample forms (AMD RDNA 2 ISA guide sections 8.2 and 12.16).
+#
+# Bounded scope: gfx1030 Wave32, non-NSA, 2D images, explicit LOD, point
+# filter and clamp addressing (validated in the descriptor content, not the
+# encoding). IMAGE_SAMPLE_LZ reads level of detail zero; IMAGE_SAMPLE_L reads
+# an explicit LOD from the address tuple. The DMASK, DIM, R128, NSA and
+# modifier fields are fixed by the decoder's image operand rule (`mimg_2d`).
+# The sampler's mip filter must be point (1); a mip filter of none (0) is
+# refused because it disables mipmapping and could not select the explicit LOD.
+
+[operand_rules.mimg_2d]
+family = "MIMG"
+src = []
+max_literals = 0
+unsupported = []
+
+[[form]]
+name = "IMAGE_SAMPLE_LZ"
+family = "MIMG"
+opcode = 39
+variant = "ImageSampleLz"
+operation = "image_sample_lz"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "wave32"
+operands = "mimg_2d"
+spec = [
+  { document = "guide", section = "8.2", page = 67 },
+  { document = "guide", section = "12.16", page = 216 },
+]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "IMAGE_SAMPLE_L"
+family = "MIMG"
+opcode = 36
+variant = "ImageSampleL"
+operation = "image_sample_l"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "wave32"
+operands = "mimg_2d"
+spec = [
+  { document = "guide", section = "8.2", page = 67 },
+  { document = "guide", section = "12.16", page = 216 },
+]
+verify = ["reference", "independent", "metal", "llvm_encoding"]

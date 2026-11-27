@@ -430,3 +430,130 @@ operands = "vop2_vcc"
 source_order = "reversed"
 spec = [{ document = "guide", section = "12.7", page = 134 }, { document = "guide", section = "3.9", page = 20 }]
 verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+# ---- VOP2 binary32 arithmetic (#784) ----
+# AMD RDNA 2 ISA guide 12.7: ADD, SUB, SUBREV and MUL on page 131, MIN on page
+# 132 and MAX on page 133. Per lane under EXEC; no SCC, VCC or EXEC write.
+# SRC0 is a VGPR, normal SGPR, vcc_lo or a literal: the guide does not say how a
+# float operation reads an integer inline constant. Unsupported at run time
+# (docs/shaders/vector-binary-f32.md): NaN inputs to ADD/SUB/SUBREV/MUL and
+# signalling NaN inputs to MIN/MAX (src_nan; MODE.IEEE and Quiet() are not
+# pinned), subnormal inputs, and ADD/SUB/SUBREV/MUL results that are NaN or
+# whose exact value is nonzero and below 2^-126 in magnitude (MODE.FP_DENORM
+# output flushing is not pinned, and Metal flushes subnormals).
+[operand_rules.vop2_f32]
+family = "VOP2"
+dst = { field = "VDST", class = "vgpr", min = 0, max = 255 }
+src = [
+  { field = "SRC0", class = "vector_source" },
+  { field = "VSRC1", class = "vgpr" },
+]
+max_literals = 1
+unsupported = [
+  "src_vcc_hi", "src_exec", "src_m0", "src_ttmp", "src_null", "src_inline", "src_float_inline",
+  "src_special", "src_nan",
+]
+
+[[form]]
+name = "V_ADD_F32"
+family = "VOP2"
+opcode = 3
+variant = "AddF32"
+operation = "add"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+spec = [{ document = "guide", section = "12.7", page = 131 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "V_SUB_F32"
+family = "VOP2"
+opcode = 4
+variant = "SubF32"
+operation = "sub"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+spec = [{ document = "guide", section = "12.7", page = 131 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "V_SUBREV_F32"
+family = "VOP2"
+opcode = 5
+variant = "SubrevF32"
+operation = "sub"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+source_order = "reversed"
+spec = [{ document = "guide", section = "12.7", page = 131 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "V_MUL_F32"
+family = "VOP2"
+opcode = 8
+variant = "MulF32"
+operation = "mul"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+spec = [{ document = "guide", section = "12.7", page = 131 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "V_MIN_F32"
+family = "VOP2"
+opcode = 15
+variant = "MinF32"
+operation = "min"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+spec = [{ document = "guide", section = "12.7", page = 132 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+
+[[form]]
+name = "V_MAX_F32"
+family = "VOP2"
+opcode = 16
+variant = "MaxF32"
+operation = "max"
+signedness = "float"
+carry_in = "none"
+width = 32
+scc = "unchanged"
+vcc = "unchanged"
+exec = "unchanged"
+wave = "any"
+operands = "vop2_f32"
+spec = [{ document = "guide", section = "12.7", page = 133 }]
+verify = ["reference", "independent", "metal", "llvm_encoding"]
+# ---- end VOP2 binary32 arithmetic (#784) ----

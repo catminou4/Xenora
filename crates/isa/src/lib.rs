@@ -19,9 +19,9 @@ pub use rdna2::{
     V_MOV_B32, V_MUL_F32, V_OR_B32, V_XOR_B32,
 };
 pub use semantics_gen::{
-    ScalarAluOp, ScalarCompareOp, ScalarImmediateCompareOp, ScalarImmediateOp, ScalarUnaryOp,
-    SoppControlOp, VectorAluOp, VectorAluVop3Op, VectorCompareOp, VectorCompareVop3Op,
-    VectorSwapOp, VectorUnaryOp,
+    ImageSampleOp, ScalarAluOp, ScalarCompareOp, ScalarImmediateCompareOp, ScalarImmediateOp,
+    ScalarUnaryOp, SoppControlOp, VectorAluOp, VectorAluVop3Op, VectorCompareOp,
+    VectorCompareVop3Op, VectorSwapOp, VectorUnaryOp,
 };
 
 impl VectorAluOp {
@@ -266,10 +266,6 @@ pub enum Instruction {
     BranchVccZero { target: usize },
     /// SOPP unconditional jump to a stream byte offset.
     Branch { target: usize },
-    /// VOP2 single-precision addition. Execution requires an explicit FP mode.
-    VectorAddF32 { dst: u8, src0: u8, src1: u8 },
-    /// VOP2 single-precision multiplication. Execution requires an explicit FP mode.
-    VectorMulF32 { dst: u8, src0: u8, src1: u8 },
     /// Full, uncompressed four-component graphics export.
     Export {
         target: ExportTarget,
@@ -285,7 +281,7 @@ pub enum Instruction {
     },
     /// MIMG image_sample_lz 2D RGBA8 texture sample with level of detail zero.
     ImageSampleLz {
-        /// Four contiguous destination VGPRs [dst..dst+3] receiving RGBA.
+        /// First destination VGPR of the DMASK-selected components.
         dst: u8,
         /// Two contiguous coordinate VGPRs [coord..coord+1] containing (u, v).
         coord: u8,
@@ -293,6 +289,25 @@ pub enum Instruction {
         resource: u8,
         /// First SGPR of the four-word sampler descriptor s[sampler..sampler+3].
         sampler: u8,
+        /// Data mask (guide Table 41, printed page 69): bit 0 = red, bit 1 =
+        /// green, bit 2 = blue, bit 3 = alpha. The selected components are
+        /// written to consecutive VGPRs starting at `dst`.
+        dmask: u8,
+    },
+    /// MIMG image_sample_l 2D RGBA8 texture sample with an explicit level of
+    /// detail read from the address tuple.
+    ImageSampleL {
+        /// First destination VGPR of the DMASK-selected components.
+        dst: u8,
+        /// Three contiguous coordinate VGPRs [coord..coord+2] containing
+        /// (u, v, lod).
+        coord: u8,
+        /// First SGPR of the eight-word resource descriptor s[resource..resource+7].
+        resource: u8,
+        /// First SGPR of the four-word sampler descriptor s[sampler..sampler+3].
+        sampler: u8,
+        /// Data mask as for [`Self::ImageSampleLz`].
+        dmask: u8,
     },
     /// Terminates the wave and waits for outstanding memory operations.
     EndProgram,
@@ -340,8 +355,6 @@ impl Instruction {
             Self::BranchExecZero { .. } => "s_cbranch_execz",
             Self::BranchVccZero { .. } => "s_cbranch_vccz",
             Self::Branch { .. } => "s_branch",
-            Self::VectorAddF32 { .. } => "v_add_f32_e32",
-            Self::VectorMulF32 { .. } => "v_mul_f32_e32",
             Self::Export { .. } => "exp",
             Self::Interpolate {
                 phase: InterpolationPhase::First,
@@ -352,6 +365,7 @@ impl Instruction {
                 ..
             } => "v_interp_p2_f32_e32",
             Self::ImageSampleLz { .. } => "image_sample_lz",
+            Self::ImageSampleL { .. } => "image_sample_l",
             Self::EndProgram => "s_endpgm",
         }
     }
@@ -407,9 +421,7 @@ impl fmt::Display for Instruction {
             Self::VectorSwap { dst, src, .. } => write!(formatter, " v{dst}, v{src}"),
             Self::VectorAluVop3 {
                 dst, src0, src1, ..
-            }
-            | Self::VectorAddF32 { dst, src0, src1 }
-            | Self::VectorMulF32 { dst, src0, src1 } => {
+            } => {
                 write!(formatter, " v{dst}, v{src0}, v{src1}")
             }
             Self::ScalarUnary { dst, src, .. } => {
@@ -497,14 +509,32 @@ impl fmt::Display for Instruction {
                 coord,
                 resource,
                 sampler,
+                dmask,
+            }
+            | Self::ImageSampleL {
+                dst,
+                coord,
+                resource,
+                sampler,
+                dmask,
             } => {
-                let last_dst = dst + 3;
-                let last_coord = coord + 1;
+                let components = dmask.count_ones() as usize;
+                let destination = if components == 1 {
+                    format!("v{dst}")
+                } else {
+                    format!("v[{dst}:{}]", dst + components as u8 - 1)
+                };
+                let last_coord = coord
+                    + if matches!(self, Self::ImageSampleL { .. }) {
+                        2
+                    } else {
+                        1
+                    };
                 let last_res = resource + 7;
                 let last_samp = sampler + 3;
                 write!(
                     formatter,
-                    " v[{dst}:{last_dst}], v[{coord}:{last_coord}], s[{resource}:{last_res}], s[{sampler}:{last_samp}] dmask:0xf dim:SQ_RSRC_IMG_2D"
+                    " {destination}, v[{coord}:{last_coord}], s[{resource}:{last_res}], s[{sampler}:{last_samp}] dmask:0x{dmask:x} dim:SQ_RSRC_IMG_2D"
                 )
             }
             Self::EndProgram => Ok(()),

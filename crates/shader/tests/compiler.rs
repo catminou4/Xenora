@@ -191,12 +191,14 @@ fn compiles_only_proven_exact_float_operations() {
         include_str!("../../../fixtures/golden/float-exact.metal")
     );
 
+    // The guide's rule for the arithmetic forms (12.7, page 131) is a rounded
+    // binary32 operation, so the compiler does not refuse a value whose
+    // domain it cannot see: the operands are in VGPRs and their values are
+    // only known at run time. A value outside the domain is refused there by
+    // the interpreters, which the semantic-review crate checks.
     let mut invalid = FLOAT.to_vec();
     invalid[16..20].copy_from_slice(&0x007f_ffffu32.to_le_bytes());
-    assert!(matches!(
-        compile(Architecture::Gfx1030, &invalid),
-        Err(CompileError::Verify { offset: 40, .. })
-    ));
+    assert!(compile(Architecture::Gfx1030, &invalid).is_ok());
 }
 
 #[test]
@@ -574,6 +576,317 @@ fn vop1_float_rounding_fixture_lowers_to_integer_bit_operations() {
 // RDNA2 guide / MSL templates in lib.rs, then checked against fold-on IR. Fold-off
 // (and default compile) must leave the op mnemonic in the IR.
 
+/// The three synthetic binding ABI descriptor loads of the image-sample
+/// fixtures: s[8:11] from offset 0x0, s[12:15] from 0x10, s[16:19] from 0x20.
+const IMAGE_SAMPLE_LOADS: [u32; 6] = [
+    0xf428_0200,
+    0xfa00_0000,
+    0xf428_0300,
+    0xfa00_0010,
+    0xf428_0400,
+    0xfa00_0020,
+];
+
+fn image_sample_program(loads: &[u32], extra: &[u32]) -> Vec<u8> {
+    let mut program: Vec<u32> = (0..12).map(|index| 0xbe88_0380 + (index << 16)).collect();
+    program.extend_from_slice(loads);
+    program.push(0xbf8c_c07f); // s_waitcnt lgkmcnt(0)
+    program.extend_from_slice(extra);
+    program.extend([
+        0x7e04_0280, // v_mov_b32_e32 v2, 0
+        0x7e06_0280, // v_mov_b32_e32 v3, 0
+        0xf09c_0108, // image_sample_lz v5, v[2:3], s[8:15], s[16:19]
+        0x0082_0502,
+        0xe070_2000, // buffer_store_dword v5, v0, s[4:7], 0 idxen
+        0x8001_0500,
+        0xbbfd_0000, // s_waitcnt_vscnt null, 0
+        0xbf81_0000, // s_endpgm
+    ]);
+    words(&program)
+}
+
+#[test]
+fn compiles_image_sample_with_the_three_descriptor_loads() {
+    compile(
+        Architecture::Gfx1030,
+        &image_sample_program(&IMAGE_SAMPLE_LOADS, &[]),
+    )
+    .expect("the synthetic descriptor loads satisfy the binding contract");
+}
+
+#[test]
+fn refuses_image_sample_without_descriptor_loads() {
+    let error = compile(Architecture::Gfx1030, &image_sample_program(&[], &[])).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CompileError::DescriptorProvenance {
+                register: 8,
+                expected: "s_buffer_load_dwordx4 s[8:11], s[0:3], 0x0",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn refuses_image_sample_with_a_descriptor_load_at_the_wrong_offset() {
+    let mut loads = IMAGE_SAMPLE_LOADS;
+    loads[3] = 0xfa00_0000; // s[12:15] from offset 0x0 instead of 0x10
+    let error = compile(Architecture::Gfx1030, &image_sample_program(&loads, &[])).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CompileError::DescriptorProvenance { register: 12, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn refuses_image_sample_with_a_narrow_descriptor_load() {
+    let mut loads = IMAGE_SAMPLE_LOADS;
+    loads[4] = 0xf424_0400; // dwordx2 into s[16:17] instead of dwordx4
+    let error = compile(Architecture::Gfx1030, &image_sample_program(&loads, &[])).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CompileError::DescriptorProvenance { register: 16, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn refuses_image_sample_after_a_later_descriptor_write() {
+    // s_mov_b32 s8, 0 after the completed descriptor loads.
+    let error = compile(
+        Architecture::Gfx1030,
+        &image_sample_program(&IMAGE_SAMPLE_LOADS, &[0xbe88_0380]),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CompileError::DescriptorProvenance { register: 8, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+/// The six assembled MIMG image-sample fixtures. Each writes a different DMASK
+/// component or an explicit LOD, so the compiled IR and MSL name the form, the
+/// sampled channels and the level.
+const IMAGE_SAMPLE_FIXTURES: [(&[u8], &str, &str, u32); 6] = [
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-lz-dmask1.bin"),
+        "sample_lz.2d.f32",
+        "r",
+        0x0000_0000,
+    ),
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-lz-dmask8.bin"),
+        "sample_lz.2d.f32",
+        "a",
+        0x0000_0000,
+    ),
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-lz-dmask5.bin"),
+        "sample_lz.2d.f32",
+        "rb",
+        0x0000_0000,
+    ),
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-lz-dmaskf.bin"),
+        "sample_lz.2d.f32",
+        "rgba",
+        0x0000_0000,
+    ),
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-l-lod0.bin"),
+        "sample_l.2d.f32",
+        "rgba",
+        0x0000_0000,
+    ),
+    (
+        include_bytes!("../../../fixtures/rdna2/image-sample-l-lod1.bin"),
+        "sample_l.2d.f32",
+        "rgba",
+        0x3f80_0000,
+    ),
+];
+
+/// The channel each DMASK-selected component selects in the generated MSL, in
+/// the order the components are written.
+fn sampled_channels(msl: &str) -> String {
+    msl.lines()
+        .filter(|line| line.contains("tex0.sample("))
+        .map(|line| {
+            let (_, tail) = line.rsplit_once('.').expect("a sampled channel");
+            tail.chars().next().expect("a sampled channel")
+        })
+        .collect()
+}
+
+/// The MSL operand of the sample's `level(...)` argument.
+fn sample_level_operand(msl: &str) -> String {
+    let line = msl
+        .lines()
+        .find(|line| line.contains("tex0.sample("))
+        .expect("a sampled texture");
+    let start = line
+        .find("level(as_type<float>(")
+        .expect("an explicit level")
+        + "level(as_type<float>(".len();
+    let tail = &line[start..];
+    tail[..tail.find("))").expect("the end of the level")].to_string()
+}
+
+/// The DMASK bit order is R, G, B, A (guide Table 41, printed page 69), so a
+/// masked sample reads exactly those channels of the texel, in that order, and
+/// an explicit LOD reaches the level the fixture asks for.
+#[test]
+fn image_sample_lowers_to_the_documented_channels_and_level() {
+    for (fixture, form, channels, level) in IMAGE_SAMPLE_FIXTURES {
+        let compiled = compile(Architecture::Gfx1030, fixture).expect("compile the fixture");
+        assert!(
+            compiled.ir.contains(form),
+            "the IR must name {form}: {}",
+            compiled.ir
+        );
+        assert_eq!(
+            sampled_channels(&compiled.msl),
+            channels,
+            "the MSL must sample the DMASK channels in R, G, B, A order: {}",
+            compiled.msl
+        );
+        let operand = sample_level_operand(&compiled.msl);
+        assert!(
+            compiled
+                .msl
+                .contains(&format!("uint {operand} = 0x{level:08x}u;")),
+            "the level must be the fixture's LOD: {}",
+            compiled.msl
+        );
+    }
+}
+
+/// The image-sample program with an initialised destination and a partial EXEC
+/// mask: the masked lanes sample and the rest keep the prior destination value.
+fn image_sample_program_with_exec(mask: u32) -> Vec<u8> {
+    let mut program: Vec<u32> = (0..12).map(|index| 0xbe88_0380 + (index << 16)).collect();
+    program.extend_from_slice(&IMAGE_SAMPLE_LOADS);
+    program.extend([
+        0xbf8c_c07f,        // s_waitcnt lgkmcnt(0)
+        0x7e04_0280,        // v_mov_b32_e32 v2, 0
+        0x7e06_0280,        // v_mov_b32_e32 v3, 0
+        0x7e0a_0280,        // v_mov_b32_e32 v5, 0
+        0xbefe_0380 | mask, // s_mov_b32 exec_lo, mask
+        0xf09c_0108,        // image_sample_lz v5, v[2:3], s[8:15], s[16:19] dmask:0x1
+        0x0082_0502,
+        0xbefe_03c1, // s_mov_b32 exec_lo, -1: the store needs a full wave
+        0xe070_2000, // buffer_store_dword v5, v0, s[4:7], 0 idxen
+        0x8001_0500,
+        0xbbfd_0000, // s_waitcnt_vscnt null, 0
+        0xbf81_0000, // s_endpgm
+    ]);
+    words(&program)
+}
+
+/// A partially active image sample writes only the lanes the EXEC mask selects
+/// and leaves the other lanes with the value their destination already held.
+#[test]
+fn image_sample_under_a_partial_exec_keeps_the_prior_destination() {
+    let compiled = compile(Architecture::Gfx1030, &image_sample_program_with_exec(5))
+        .expect("compile a partially active image sample");
+    assert!(
+        compiled.ir.contains("merge.lanes mask=0x00000005"),
+        "the IR must merge the sample with the prior destination: {}",
+        compiled.ir
+    );
+    assert!(
+        compiled
+            .msl
+            .contains("((0x00000005u >> (index & 31u)) & 1u) != 0u ?"),
+        "the sampled value must reach only the lanes the mask selects: {}",
+        compiled.msl
+    );
+}
+
+/// Every translated sample checks its domain before the result is used: finite
+/// coordinates always, a whole mip level for an explicit LOD, and only in the
+/// lanes EXEC selects. A failing lane sets the `[[buffer(2)]]` fault word.
+#[test]
+fn image_samples_guard_their_runtime_domain() {
+    for (fixture, form, _, _) in IMAGE_SAMPLE_FIXTURES {
+        let compiled = compile(Architecture::Gfx1030, fixture).expect("compile image sample");
+        let msl = &compiled.msl;
+        assert!(
+            msl.contains("device atomic_uint* fault [[buffer(2)]]"),
+            "{msl}"
+        );
+        assert!(
+            msl.contains("static inline bool xenora_finite(uint bits)")
+                && msl.contains("static inline bool xenora_whole_level(uint bits, uint levels)"),
+            "{msl}"
+        );
+        let samples = msl.matches(".sample(samp0").count();
+        let guards = msl
+            .matches("atomic_fetch_or_explicit(fault, bad, memory_order_relaxed)")
+            .count();
+        assert_eq!(samples, guards, "every sample is guarded: {msl}");
+        assert_eq!(
+            msl.matches("bad |= 2u;").count(),
+            samples,
+            "coordinate check: {msl}"
+        );
+        let lod_checks = msl
+            .matches("tex0.get_num_mip_levels())) { bad |= 1u; }")
+            .count();
+        if form == "sample_l.2d.f32" {
+            assert_eq!(lod_checks, samples, "explicit LOD check: {msl}");
+            assert!(
+                compiled.ir.contains(", lod t"),
+                "IR names the LOD: {}",
+                compiled.ir
+            );
+        } else {
+            assert_eq!(lod_checks, 0, "LZ has no LOD to check: {msl}");
+        }
+        // Full EXEC: the guard has no lane condition.
+        assert!(msl.contains("if (bad != 0u) {"), "{msl}");
+    }
+    assert_eq!(xenora_shader::SAMPLE_FAULT_LOD, 1);
+    assert_eq!(xenora_shader::SAMPLE_FAULT_COORDINATES, 2);
+}
+
+/// Under a partial EXEC only the selected lanes may report a domain fault, so
+/// an inactive lane's coordinate cannot refuse the dispatch.
+#[test]
+fn image_sample_domain_guard_follows_a_partial_exec() {
+    let compiled = compile(Architecture::Gfx1030, &image_sample_program_with_exec(5))
+        .expect("compile a partially active image sample");
+    assert!(
+        compiled
+            .msl
+            .contains("if (bad != 0u && ((0x00000005u >> (index & 31u)) & 1u) != 0u) {"),
+        "{}",
+        compiled.msl
+    );
+    assert!(compiled.ir.contains("exec=0x00000005"), "{}", compiled.ir);
+}
+
+/// A program without an image sample keeps the two-buffer kernel signature.
+#[test]
+fn programs_without_samples_bind_no_fault_word() {
+    for fixture in [FIXTURE, BRANCH, FLOAT] {
+        let compiled = compile(Architecture::Gfx1030, fixture).expect("compile fixture");
+        assert!(!compiled.msl.contains("fault"), "{}", compiled.msl);
+        assert!(!compiled.msl.contains("xenora_finite"), "{}", compiled.msl);
+    }
+}
+
 fn words(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
@@ -816,11 +1129,19 @@ fn folds_ffbh_i32_on_zero_all_ones_and_one() {
 }
 
 #[test]
-fn folds_exact_positive_normal_float_add() {
-    // 1.0 + 2.0 = 3.0 exactly (positive normals). Bits: 0x3f800000 + 0x40000000
-    // → 0x40400000. VOP2 add_f32 OP=3.
+fn does_not_fold_a_constant_float_add() {
+    // 1.0 + 2.0 = 3.0 exactly, but a float add is not folded: the guide's
+    // rule (12.7, page 131) is a rounded binary32 operation, so the value is
+    // computed where the two paths agree on it.
     let code = binary_const_fixture(3, 0x3f80_0000, 0x4000_0000, false);
-    assert_folds_to(&code, "add.f32", 0x4040_0000);
+    let plain = compile_fold_off(&code);
+    let folded = compile_fold_on(&code);
+    assert!(plain.ir.contains("add.f32"), "{}", plain.ir);
+    assert_eq!(
+        folded.ir, plain.ir,
+        "the fold pass must not fold a float add"
+    );
+    assert!(!plain.ir.contains("0x40400000"));
 }
 
 #[test]
@@ -850,37 +1171,30 @@ fn float_add_from_load_stays_unfolded_with_fold_on() {
 }
 
 #[test]
-fn rejects_inexact_float_add_of_constants_at_verify() {
-    // Both operands are positive normals, but 1.0 + 2^-24 is not representable
-    // in f32 (ulp of 1.0 is 2^-23), so exact_float_result refuses. Lift/verify
-    // rejects before fold_constant_ops runs; the op cannot "stay unfolded".
-    // Probed: fold_off and fold_on both return Verify at the add_f32 word.
+fn accepts_an_inexact_float_add_of_constants() {
+    // Both operands are positive normals, but 1.0 + 2^-24 is not
+    // representable in f32 (ulp of 1.0 is 2^-23). The guide's rule (12.7,
+    // page 131) rounds it to nearest even, so the program is compiled and
+    // the value is computed at run time.
     let code = binary_const_fixture(3, 0x3f80_0000, 0x3380_0000, false);
-    let off = compile_with(
-        Architecture::Gfx1030,
-        &code,
-        CompileOptions {
-            fold_constants: false,
-            ..CompileOptions::default()
-        },
-    );
-    let on = compile_with(
-        Architecture::Gfx1030,
-        &code,
-        CompileOptions {
-            fold_constants: true,
-            ..CompileOptions::default()
-        },
-    );
-    assert!(
-        matches!(off, Err(CompileError::Verify { .. })),
-        "fold-off must reject inexact constant add.f32 at verify: {off:?}"
-    );
-    assert!(
-        matches!(on, Err(CompileError::Verify { .. })),
-        "fold-on must reject inexact constant add.f32 at verify: {on:?}"
-    );
-    // Folder unchanged: no stay-unfolded path exists for this pair.
+    for fold in [false, true] {
+        let result = compile_with(
+            Architecture::Gfx1030,
+            &code,
+            CompileOptions {
+                fold_constants: fold,
+                ..CompileOptions::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "fold={fold} must accept the constant add.f32: {result:?}"
+        );
+        assert!(
+            result.unwrap().ir.contains("add.f32"),
+            "fold={fold} must keep the add"
+        );
+    }
 }
 
 // --- Opt-in common-subexpression elimination (#142) ---------------------------
@@ -1460,11 +1774,10 @@ fn cse_interacts_with_constant_folding() {
 }
 
 #[test]
-fn cse_does_not_fold_exact_float_add() {
-    // 1.0 + 2.0 = 3.0 exactly. Bits 0x3f800000 + 0x40000000 = 0x40400000.
-    // CSE reuses the add and leaves the operation. Folding replaces both
-    // adds with that constant. Enabling both matches folding alone: the adds
-    // are gone before reuse, and the two result constants are not merged.
+fn cse_reuses_a_float_add_without_folding_it() {
+    // 1.0 + 2.0 = 3.0 exactly, but a float add is not folded, so CSE reuses
+    // the operation itself: the second add becomes a reuse of the first.
+    // The fold pass does not fold a float add, so it changes nothing.
     let code = words(&[
         mov_lit(2),
         0x3f80_0000,
@@ -1477,19 +1790,19 @@ fn cse_does_not_fold_exact_float_add() {
         0xbbfd_0000,
         0xbf81_0000,
     ]);
+    let plain_ir = "\
+0000: t0 = const.u32 0x3f800000
+0008: t1 = const.u32 0x40000000
+0010: t2 = add.f32 t0, t1
+0014: t3 = add.f32 t0, t1
+0018: store.u32 output[index], t3
+";
     let cse_ir = "\
 0000: t0 = const.u32 0x3f800000
 0008: t1 = const.u32 0x40000000
 0010: t2 = add.f32 t0, t1
 0014: t3 = reuse.u32 t2
 0018: store.u32 output[index], t2
-";
-    let fold_ir = "\
-0000: t0 = const.u32 0x3f800000
-0008: t1 = const.u32 0x40000000
-0010: t2 = const.u32 0x40400000
-0014: t3 = const.u32 0x40400000
-0018: store.u32 output[index], t3
 ";
     let cse_msl = "\
 #include <metal_stdlib>
@@ -1507,21 +1820,19 @@ kernel void xenora_compute(
     output[index] = t2;
 }
 ";
-    let folded = compile_options(&code, true, false);
-    let both = compile_options(&code, true, true);
+    assert_eq!(compile_options(&code, false, false).ir, plain_ir);
     assert_eq!(compile_options(&code, false, true).ir, cse_ir);
     assert_eq!(compile_options(&code, false, true).msl, cse_msl);
-    assert_eq!(folded.ir, fold_ir);
-    assert_eq!(both.ir, folded.ir);
-    assert_eq!(both.msl, folded.msl);
+    assert_eq!(compile_options(&code, true, false).ir, plain_ir);
+    assert_eq!(compile_options(&code, true, true).ir, cse_ir);
     assert!(!cse_ir.contains("0x40400000"));
-    assert_eq!(fold_ir.matches("const.u32 0x40400000").count(), 2);
 }
 
 #[test]
-fn cse_does_not_bypass_inexact_float_verification() {
-    // Same pair the folder refuses: 1.0 + 2^-24 is not an f32 value. Verify
-    // rejects it before either optional pass.
+fn cse_does_not_change_an_inexact_float_add() {
+    // Same pair as accepts_an_inexact_float_add_of_constants: 1.0 + 2^-24 is
+    // not an f32 value, but the guide's rule rounds it, so the program is
+    // compiled whichever optional pass runs.
     let code = binary_const_fixture(3, 0x3f80_0000, 0x3380_0000, false);
     for fold in [false, true] {
         for cse in [false, true] {
@@ -1534,8 +1845,8 @@ fn cse_does_not_bypass_inexact_float_verification() {
                 },
             );
             assert!(
-                matches!(result, Err(CompileError::Verify { .. })),
-                "fold={fold} cse={cse} must reject at verify: {result:?}"
+                result.is_ok(),
+                "fold={fold} cse={cse} must accept the add: {result:?}"
             );
         }
     }

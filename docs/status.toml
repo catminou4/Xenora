@@ -2104,9 +2104,9 @@ llvm = "three-way passed"
 
 [[instruction]]
 form = "v_add_f32_e32"
-encoding = "Two VGPR sources and one VGPR destination"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; D = S0.f32 + S1.f32, rounded to nearest even (MODE.FP_ROUND pinned to nearest even); subnormal inputs, NaN inputs and NaN results refused; inactive lanes keep VDST"
 representation = "`06020702`"
-lowering = "MSL FP32 add"
+lowering = "per-thread binary32 arithmetic in Metal, with contraction and reassociation off"
 reference = "implemented"
 cpu = "fixture verified"
 gpu = "fixture verified"
@@ -2116,9 +2116,9 @@ llvm = "three-way passed"
 
 [[instruction]]
 form = "v_mul_f32_e32"
-encoding = "Two VGPR sources and one VGPR destination"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; D = S0.f32 * S1.f32, rounded to nearest even (MODE.FP_ROUND pinned to nearest even); subnormal inputs, NaN inputs and NaN results refused; inactive lanes keep VDST"
 representation = "`10020702`"
-lowering = "MSL FP32 multiply"
+lowering = "per-thread binary32 arithmetic in Metal, with contraction and reassociation off"
 reference = "implemented"
 cpu = "fixture verified"
 gpu = "fixture verified"
@@ -2506,6 +2506,78 @@ lowering = "per-thread integer expression with EXEC masking"
 reference = "implemented"
 cpu = "local known-answer test passed"
 gpu = "local Apple M5 readback passed; acceptance pending"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "v_sub_f32_e32"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; D = S0.f32 - S1.f32, rounded to nearest even (MODE.FP_ROUND pinned to nearest even); subnormal inputs, NaN inputs and NaN results refused; inactive lanes keep VDST"
+representation = "`08020702`"
+lowering = "per-thread binary32 arithmetic in Metal, with contraction and reassociation off"
+reference = "implemented"
+cpu = "local known-answer test passed"
+gpu = "acceptance pending"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "v_subrev_f32_e32"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; D = S1.f32 - S0.f32, the second input minus the first, rounded to nearest even (MODE.FP_ROUND pinned to nearest even); subnormal inputs, NaN inputs and NaN results refused; inactive lanes keep VDST"
+representation = "`0A020702`"
+lowering = "per-thread binary32 arithmetic in Metal, with contraction and reassociation off"
+reference = "implemented"
+cpu = "local known-answer test passed"
+gpu = "acceptance pending"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "v_min_f32_e32"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; the guide's p132 minimum: a quiet NaN gives the other operand, a +0/-0 pair gives -0, otherwise S0 < S1 ? S0 : S1; subnormal inputs and signalling NaN inputs refused; inactive lanes keep VDST"
+representation = "`1E020702`"
+lowering = "per-thread integer tests on the binary32 bits, not Metal fmin, which differs on signed zeros"
+reference = "implemented"
+cpu = "local known-answer test passed"
+gpu = "acceptance pending"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "v_max_f32_e32"
+encoding = "VOP2, Wave32; VGPR VDST with VGPR, normal SGPR, vcc_lo, inline integer or literal SRC0; VGPR VSRC1; the guide's p133 maximum: a quiet NaN gives the other operand, a +0/-0 pair gives +0, otherwise S0 >= S1 ? S0 : S1; subnormal inputs and signalling NaN inputs refused; inactive lanes keep VDST"
+representation = "`20020702`"
+lowering = "per-thread integer tests on the binary32 bits, not Metal fmax, which differs on signed zeros"
+reference = "implemented"
+cpu = "local known-answer test passed"
+gpu = "acceptance pending"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "image_sample_lz"
+encoding = "MIMG, Wave32, non-NSA, 2D RGBA8 unorm, explicit LOD 0, DMASK 1-15, point filter and clamp-to-last-texel addressing"
+representation = "8 B"
+lowering = "MSL texture sample at level zero"
+reference = "implemented"
+cpu = "fixture verified"
+gpu = "fixture verified"
+recognized = true
+decoded = true
+llvm = "three-way passed"
+
+[[instruction]]
+form = "image_sample_l"
+encoding = "MIMG, Wave32, non-NSA, 2D RGBA8 unorm, explicit LOD from the address tuple, DMASK 1-15, point filter and clamp-to-last-texel addressing"
+representation = "8 B"
+lowering = "MSL texture sample at an explicit level"
+reference = "implemented"
+cpu = "fixture verified"
+gpu = "fixture verified"
 recognized = true
 decoded = true
 llvm = "three-way passed"

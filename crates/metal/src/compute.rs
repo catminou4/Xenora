@@ -20,7 +20,8 @@ use objc2_metal::{
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use xenora_texture::{
-    Bc1Upload, BcAlphaFormat, BcAlphaUpload, BcChannelFormat, BcChannelUpload, TiledBc1,
+    AddressMode, Bc1Upload, BcAlphaFormat, BcAlphaUpload, BcChannelFormat, BcChannelUpload,
+    FilterMode, TiledBc1,
 };
 
 #[path = "render.rs"]
@@ -155,6 +156,16 @@ enum ComputeInput<'a> {
         sampler: &'a ProtocolObject<dyn MTLSamplerState>,
         coords: &'a [u32],
     },
+    /// A translated gfx1030 kernel that samples a bound texture: the input
+    /// words go to `[[buffer(0)]]`, output to `[[buffer(1)]]`, and the texture
+    /// and sampler to `[[texture(0)]]` and `[[sampler(0)]]`, and the one-word
+    /// sample-domain fault flag to `[[buffer(2)]]`.
+    WordsSampled {
+        words: &'a [u32],
+        texture: &'a ProtocolObject<dyn MTLTexture>,
+        sampler: &'a ProtocolObject<dyn MTLSamplerState>,
+        fault: &'a ProtocolObject<dyn MTLBuffer>,
+    },
 }
 
 impl ComputeInput<'_> {
@@ -163,6 +174,7 @@ impl ComputeInput<'_> {
             Self::Words(words) => words.len(),
             Self::Texture(_, pixels) => *pixels,
             Self::SampledTexture { coords, .. } => coords.len() / 2,
+            Self::WordsSampled { words, .. } => words.len(),
         }
     }
 }
@@ -347,6 +359,7 @@ struct InFlightResources {
     output: SharedBuffer,
     _texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     _sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+    _fault: Option<SharedBuffer>,
     gate: Option<Retained<ProtocolObject<dyn MTLSharedEvent>>>,
     word_count: usize,
 }
@@ -842,6 +855,54 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
             .map(|profile| profile.output)
     }
 
+    /// Run trusted MSL that also samples a bound RGBA8 texture and sampler.
+    ///
+    /// The input words reach `[[buffer(0)]]`, the output `[[buffer(1)]]`, and
+    /// the validated texture and sampler `[[texture(0)]]` and `[[sampler(0)]]`.
+    /// The bounds, completion and trusted-kernel requirements of
+    /// [`Self::run_words`] apply. The kernel also takes a zeroed fault word at
+    /// `[[buffer(2)]]`; a nonzero word after completion means an active lane
+    /// sampled outside the supported domain, and the output is discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for out-of-policy input sizes, compilation, resource
+    /// setup, dispatch or completion failure, and when an active lane's
+    /// explicit LOD is not a whole mip level or a coordinate is NaN or
+    /// infinite (the cases the CPU reference refuses).
+    pub fn run_words_sampled(
+        &self,
+        source: &str,
+        entry: &str,
+        input: &[u32],
+        texture: &crate::texture_pipeline::MetalRgba8Texture,
+        sampler: &crate::sampler::MetalSampler,
+    ) -> Result<Vec<u32>, MetalError> {
+        validate_words(source, entry, input)?;
+        validate_image_binding(input, texture, sampler)?;
+        autoreleasepool(|_| {
+            let fault = self.new_buffer(&[0])?;
+            let output = self
+                .run_sized(
+                    source,
+                    entry,
+                    ComputeInput::WordsSampled {
+                        words: input,
+                        texture: texture.raw(),
+                        sampler: sampler.raw(),
+                        fault: &fault,
+                    },
+                    None,
+                )?
+                .output;
+            // SAFETY: run_sized returned after the command buffer completed, so
+            // the GPU no longer writes the live, one-word shared buffer.
+            let flags = unsafe { fault.contents().cast::<u32>().as_ptr().read() };
+            sample_domain_result(flags)?;
+            Ok(output)
+        })
+    }
+
     /// Resolve a synthetic guest input view and run the trusted fixture kernel.
     ///
     /// The validated word range is copied into its own Metal buffer at slot zero.
@@ -1154,6 +1215,7 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
             ComputeInput::SampledTexture { coords, .. } => {
                 Some(pool.acquire(&self.device, coords)?)
             }
+            ComputeInput::WordsSampled { words, .. } => Some(pool.acquire(&self.device, words)?),
             ComputeInput::Texture(..) => None,
         };
         let words = vec![0xA5A5_A5A5; input.len()];
@@ -1236,6 +1298,16 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
                     encoder.setTexture_atIndex(Some(texture), 0);
                     encoder.setSamplerState_atIndex(Some(sampler), 0);
                 }
+                ComputeInput::WordsSampled {
+                    texture,
+                    sampler,
+                    fault,
+                    ..
+                } => {
+                    encoder.setTexture_atIndex(Some(texture), 0);
+                    encoder.setSamplerState_atIndex(Some(sampler), 0);
+                    encoder.setBuffer_offset_atIndex(Some(fault), 0, 2);
+                }
                 ComputeInput::Words(..) => {}
             }
             if let Some(buffer) = input_buffer.as_deref() {
@@ -1246,12 +1318,22 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
         encoder.dispatchThreads_threadsPerThreadgroup(size(input.len()), size(width));
         encoder.endEncoding();
         let encode_seconds = encode_start.elapsed().as_secs_f64();
-        let (texture, sampler) = match input {
-            ComputeInput::Texture(texture, _) => (Some(texture.retain()), None),
+        let (texture, sampler, fault) = match input {
+            ComputeInput::Texture(texture, _) => (Some(texture.retain()), None, None),
             ComputeInput::SampledTexture {
                 texture, sampler, ..
-            } => (Some(texture.retain()), Some(sampler.retain())),
-            ComputeInput::Words(_) => (None, None),
+            } => (Some(texture.retain()), Some(sampler.retain()), None),
+            ComputeInput::WordsSampled {
+                texture,
+                sampler,
+                fault,
+                ..
+            } => (
+                Some(texture.retain()),
+                Some(sampler.retain()),
+                Some(fault.retain()),
+            ),
+            ComputeInput::Words(_) => (None, None, None),
         };
         let resources = InFlightResources {
             command,
@@ -1260,6 +1342,7 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
             output: output_buffer,
             _texture: texture,
             _sampler: sampler,
+            _fault: fault,
             gate: gate.map(Message::retain),
             word_count: input.len(),
         };
@@ -1394,6 +1477,98 @@ kernel void sample_rgba8(texture2d<float, access::sample> tex [[texture(0)]],
         }
         .ok_or_else(|| MetalError::new("newBufferWithBytes", "shared buffer allocation failed"))
     }
+}
+
+/// The guard bits a translated sample kernel sets in its fault word. They are
+/// `xenora_shader::SAMPLE_FAULT_LOD` and `SAMPLE_FAULT_COORDINATES`; the metal
+/// crate does not depend on the shader crate, so the values are repeated here
+/// and pinned by the native sample tests.
+const SAMPLE_FAULT_LOD: u32 = 1;
+const SAMPLE_FAULT_COORDINATES: u32 = 2;
+
+/// Refuse a dispatch whose fault word reports an out-of-domain active lane.
+fn sample_domain_result(flags: u32) -> Result<(), MetalError> {
+    if flags == 0 {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    if flags & SAMPLE_FAULT_LOD != 0 {
+        reasons.push("an active lane's explicit LOD is not a whole mip level");
+    }
+    if flags & SAMPLE_FAULT_COORDINATES != 0 {
+        reasons.push("an active lane's texture coordinate is NaN or infinite");
+    }
+    if flags & !(SAMPLE_FAULT_LOD | SAMPLE_FAULT_COORDINATES) != 0 {
+        reasons.push("the kernel set an unknown fault bit");
+    }
+    Err(MetalError::new("image sample domain", reasons.join("; ")))
+}
+
+/// Validate the T# and S# the synthetic input carries against the bound texture
+/// and sampler state before a translated sample runs.
+///
+/// The descriptor words are parsed with the `xenora-ref` reference functions so
+/// the GPU path and the CPU oracle agree on what a valid descriptor is. The
+/// crate graph permits the dependency (the reference crate has no dependencies
+/// of its own); the shared copy alternative was not needed.
+fn validate_image_binding(
+    input: &[u32],
+    texture: &crate::texture_pipeline::MetalRgba8Texture,
+    sampler: &crate::sampler::MetalSampler,
+) -> Result<(), MetalError> {
+    use xenora_ref::texture_sampling;
+
+    let resource: [u32; 8] = input
+        .get(0..8)
+        .ok_or_else(|| {
+            MetalError::new(
+                "image resource descriptor",
+                "input has fewer than eight descriptor words",
+            )
+        })?
+        .try_into()
+        .expect("a slice of length eight");
+    let sampler_words: [u32; 4] = input
+        .get(8..12)
+        .ok_or_else(|| {
+            MetalError::new(
+                "image sampler descriptor",
+                "input has fewer than twelve descriptor words",
+            )
+        })?
+        .try_into()
+        .expect("a slice of length four");
+    let (desc, _base) = texture_sampling::parse_resource_descriptor(resource)
+        .map_err(|error| MetalError::new("image resource descriptor", error.to_string()))?;
+    let last_level = desc.mips - 1;
+    texture_sampling::validate_sampler_descriptor(sampler_words, last_level)
+        .map_err(|error| MetalError::new("image sampler descriptor", error.to_string()))?;
+
+    let bound = texture.desc();
+    if (desc.width, desc.height, desc.mips) != (bound.width, bound.height, bound.mips) {
+        return Err(MetalError::new(
+            "image resource descriptor",
+            "descriptor disagrees with the bound texture width, height or mip count",
+        ));
+    }
+
+    let state = sampler.desc();
+    let nearest = |filter: FilterMode| matches!(filter, FilterMode::Nearest);
+    let clamp = |mode: AddressMode| matches!(mode, AddressMode::ClampToEdge);
+    if !nearest(state.min_filter)
+        || !nearest(state.mag_filter)
+        || !nearest(state.mip_filter)
+        || !clamp(state.address_u)
+        || !clamp(state.address_v)
+        || state.min_lod != 0.0
+        || state.max_lod < last_level as f32
+    {
+        return Err(MetalError::new(
+            "image sampler descriptor",
+            "descriptor disagrees with the bound sampler state",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_words(source: &str, entry: &str, input: &[u32]) -> Result<(), MetalError> {

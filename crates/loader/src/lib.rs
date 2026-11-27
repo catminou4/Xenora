@@ -15,6 +15,7 @@ pub mod import_table;
 pub mod imports;
 pub mod jit;
 pub mod memory;
+pub mod module_graph;
 pub mod output_path;
 pub mod pe;
 pub mod probe;

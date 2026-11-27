@@ -57,6 +57,9 @@ registry row that depends on it.
 | resource type field | 65, 75 | V# has a 2-bit type field; T# has 4 bits. | Both come from the pinned XML snapshot, not from the prose. |
 | `const_stride` | 60 | A 14-bit field with the range "0 to 16,383 bytes, or 0 to 262,143 bytes". | A 14-bit field reaches 16,383. The second range cannot be reached. |
 | `const_num_records` | 60, 65 | Tables 33 and 37 disagree on the unit. | The field description on page 60 is used: bytes when `const_stride == 0` or the swizzle is off, otherwise stride units. |
+| `DS_PERMUTE_B32`, `DS_BPERMUTE_B32` lane index | 97, 205 | Section 10.4.4 says only index bits [6:2] are used, which selects one of 32 lanes. The section 12.13 pseudocode takes `floor((ADDR + OFFSET) / 4) mod 64` and loops over lanes 0..63. | Not implemented. A Wave32 batch takes the lane from bits [6:2] of the byte index after adding `OFFSET`, as section 10.4.4 says. It records the 12.13 reading as the Wave64 rule and does not apply it to Wave32. |
+| `DS_PERMUTE_B32` colliding writers | 205 | The pseudocode comment says the highest-numbered source lane wins when several lanes select one destination; the prose under it says the result "is not predictable" and is one of the writers. | Not implemented. A batch refuses, or excludes from its oracle, any case where two active lanes select the same destination, until hardware evidence settles which is right. |
+| FLAT `OFFSET` | 83, 279 | Section 9.1 describes a 12-bit field and says "Flat: must be positive"; the encoding chapter calls it an "11-bit unsigned offset (MSB is ignored)". One says bit 11 is forbidden, the other that it is ignored. | Not implemented. A FLAT batch decodes bits 10:0 as an unsigned offset and refuses an encoding with bit 11 set instead of ignoring it, because the two readings agree only when bit 11 is clear. Scratch and Global use the 12-bit signed offset both pages give. |
 | cube `face_id` | 71-72 | Section 8.2.3 says `face_id = slice * 6 + face`; section 8.2.4 says `face_id = slice * 8 + face`. | A cube array slice holds six faces, so the with-sampler formula is wrong. Not implemented. |
 | A16 offset | 70, 73 | The offset is signed in one place and unsigned in the other. | The pinned XML is authoritative. |
 | T# base address | 75 | Described as 40 bits "representing bits 47:8". | The pinned XML is authoritative. |
@@ -114,6 +117,11 @@ implemented wrongly.
 - **MODE holds two round-mode fields and two denormal fields.** Page 47:
   `FP_ROUND[1:0]` is the single-precision mode and `[3:2]` the double and half
   mode; `FP_DENORM[5:4]` is single and `[7:6]` double and half.
+- **A 64-bit float literal keeps its 32 bits in the high half.** Page 43:
+  for a 64-bit float "the lower 32-bit are padded with zero". This reads as
+  if it loses the value, but it is right: the literal supplies bits 63:32 (sign,
+  exponent and the top of the mantissa) and bits 31:0 are zero. It is not an
+  erratum; integer literals are zero- or sign-extended instead (same page).
 - **`S_BFE_U32` and `S_BFE_I32` write SCC.** Pages 104 and 105 give `SCC = (D.u != 0)` and `SCC = (D.i != 0)`.
   Older guides omit the SCC line, which is why the errata list mentions them.
 

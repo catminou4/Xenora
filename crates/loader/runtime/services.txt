@@ -158,6 +158,16 @@ service ucrtbase.dll __stdio_common_vsscanf(options: u64, buffer: ptr, count: u6
     ref corecrt_stdio_config.h __stdio_common_vsscanf; Microsoft Learn, scanf and the scanf type-field characters
     test legacy_sscanf_follows_the_reference_vectors
 
+service ucrtbase.dll __stdio_common_vfscanf(options: u64, stream: ptr, format: ptr, locale: ptr, arguments: ptr) -> i32
+    handler vfscanf
+    status partial
+    alias api-ms-win-crt-stdio-l1-1-0.dll
+    fails EOF with errno EINVAL for a null stream or format; EOF with errno EBADF for stdout, stderr or a stream not open for reading; EOF for an input failure before the first conversion; stops the guest for a pointer that is no stream and as __stdio_common_vsscanf does
+    ref corecrt_stdio_config.h __stdio_common_vfscanf; ISO C 7.21.6.2; Microsoft Learn, fscanf and fscanf_s and fopen (text mode)
+    test scanf_reads_stdin_from_where_the_last_read_stopped
+    test fscanf_reads_a_text_file_and_leaves_the_position_after_the_input
+    test fscanf_fails_on_streams_that_cannot_be_read
+
 service ucrtbase.dll __stdio_common_vsprintf(options: u64, buffer: ptr, count: u64, format: ptr, locale: ptr, arguments: ptr) -> i32
     handler vsprintf
     status partial

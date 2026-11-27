@@ -34,12 +34,12 @@ fn declared_semantic_forms_are_exactly_those_decoded_from_fixtures() {
         "{:?}",
         decoded.difference(&declared)
     );
-    // Covered by inline words in tests/gfx1030.rs rather than fixture binaries.
+    // Every declared form now appears in an assembled fixture binary.
     let inline_only: BTreeSet<_> = declared
         .difference(&decoded)
         .map(|(name, _)| *name)
         .collect();
-    assert_eq!(inline_only, BTreeSet::from(["IMAGE_SAMPLE_LZ"]));
+    assert!(inline_only.is_empty(), "{inline_only:?}");
     for (name, family) in SEMANTIC_FORMS {
         assert!(
             FORMS

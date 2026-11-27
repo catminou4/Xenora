@@ -39,7 +39,7 @@ FORM_KEYS = {
 }
 TOP_KEYS = {
     "schema", "architecture", "source_sha256", "documents", "operand_rules", "form",
-    "encoding_variant",
+    "encoding_variant", "append_after_variants",
 }
 # An encoding variant is another encoding of a form already in the registry (for
 # example the VOP3 `_e64` encoding of a VOP2 form): pure data that names the base
@@ -77,7 +77,15 @@ OPERATIONS = {
     "mul24": "Multiply24", "mul_hi24": "MultiplyHigh24",
     "mov": "Move", "cmov": "ConditionalMove", "swap": "Swap",
     "trunc": "Truncate", "ceil": "Ceiling", "rndne": "RoundNearestEven", "floor": "Floor",
+    # MIMG image sample forms. They have no primitive.rs function: the
+    # operation names the texture sample the decoder, reference, interpreters
+    # and MSL lowering implement.
+    "image_sample_lz": "ImageSampleLz",
+    "image_sample_l": "ImageSampleL",
 }
+# MIMG image operations. Their operand rule has kind "image"; behaviour comes
+# from the MIMG contract (docs/shaders/mimg.md), not from a primitive function.
+IMAGE_OPERATIONS = {"image_sample_lz", "image_sample_l"}
 # Unary operations read one source; they need an operand rule of the unary kind.
 UNARY = {
     "not", "brev", "bcnt0", "bcnt1", "ff0", "ff1", "flbit", "sext", "abs",
@@ -85,6 +93,12 @@ UNARY = {
 }
 # Binary32 rounding to an integral value (guide 12.8). They take float operands only.
 FLOAT_ROUNDING = {"trunc", "ceil", "rndne", "floor"}
+# ---- VOP2 binary32 arithmetic (#784) ----
+# V_ADD/SUB/SUBREV/MUL/MIN/MAX_F32 (guide 12.7, pages 131-133) reuse these
+# operation names with signedness float; only the vop2_f32 rule takes them.
+VOP2_FLOAT_ARITHMETIC = {"add", "sub", "mul", "min", "max"}
+FLOAT_OPERATIONS = FLOAT_ROUNDING | VOP2_FLOAT_ARITHMETIC
+# ---- end VOP2 binary32 arithmetic (#784) ----
 # Sign extension reads only the low source_bits of S0 (required for sext only).
 SOURCE_BITS_KEY = "source_bits"
 SOURCE_BITS = {8, 16}
@@ -173,7 +187,7 @@ EXEC_COMBINE = {"and", "or", "xor", "andn2", "orn2", "nand", "nor", "xnor", "and
 WAVE = {"any": "Any", "wave32": "Wave32"}
 # The synthetic compute fixture ABI fixes the wave size for these operand-rule
 # kinds and for the VCC-reading VOP2 rule. Other forms declare "any".
-WAVE_BY_KIND = {"control": "wave32", "vector_compare": "wave32", "vector_unary": "wave32", "vector_swap": "wave32"}
+WAVE_BY_KIND = {"control": "wave32", "vector_compare": "wave32", "vector_unary": "wave32", "vector_swap": "wave32", "image": "wave32"}
 VCC_VECTOR_PRIMITIVES = {
     ("cselect", "bitwise"): "Select",
     ("add", "unsigned"): "AddCarry",
@@ -282,6 +296,14 @@ VECTOR_PRIMITIVES = {
     ("lshl", "bitwise"): "ShiftLeft",
     ("lshr", "bitwise"): "ShiftRight",
     ("ashr", "signed"): "ArithmeticShiftRight",
+    # ---- VOP2 binary32 arithmetic (#784) ----
+    # V_SUBREV_F32 is ("sub", "float") with source_order = "reversed".
+    ("add", "float"): "AddF32",
+    ("sub", "float"): "SubF32",
+    ("mul", "float"): "MulF32",
+    ("min", "float"): "MinF32",
+    ("max", "float"): "MaxF32",
+    # ---- end VOP2 binary32 arithmetic (#784) ----
 }
 
 # Operand rules the decoder implements, each exactly once. A registry rule must
@@ -641,6 +663,41 @@ OPERAND_RULES = {
         },
         "kind": "vector",
     },
+    # ---- VOP2 binary32 arithmetic (#784) ----
+    # As vop1_f32: the guide does not say how a float operation reads an
+    # integer inline constant, so SRC0 is a VGPR, normal SGPR, vcc_lo or a
+    # literal; NaN source values are an unsupported variant.
+    "vop2_f32": {
+        "rust": "Vop2F32",
+        "enum": "VectorAluOp",
+        "shape": {
+            "family": "VOP2",
+            "dst": {"field": "VDST", "class": "vgpr", "min": 0, "max": 255},
+            "src": [
+                {"field": "SRC0", "class": "vector_source"},
+                {"field": "VSRC1", "class": "vgpr"},
+            ],
+            "max_literals": 1,
+        },
+        "unsupported": {
+            "src_vcc_hi", "src_exec", "src_m0", "src_ttmp", "src_null", "src_inline",
+            "src_float_inline", "src_special", "src_nan",
+        },
+        "kind": "vector",
+    },
+    # ---- end VOP2 binary32 arithmetic (#784) ----
+    # MIMG image sample (IMAGE_SAMPLE_LZ and IMAGE_SAMPLE_L). The image operand
+    # structure (VDATA, VADDR, SRSRC, SSAMP, plus the DMASK, DIM, R128 and
+    # modifier fields) does not fit the src/dst shape of the ALU rules, so the
+    # shape declares no fields and the decoder validates the image encoding. The
+    # generator emits a dedicated `from_word` for the split OP field.
+    "mimg_2d": {
+        "rust": "Mimg2D",
+        "enum": "ImageSampleOp",
+        "shape": {"family": "MIMG", "src": [], "max_literals": 0},
+        "unsupported": set(),
+        "kind": "image",
+    },
 }
 
 VARIANT = re.compile(r"^[A-Z][A-Za-z0-9]*$")
@@ -857,6 +914,24 @@ def _check_xml(form, rule, snapshot, errors):
         errors.append(
             f"{label}: exec {form['exec']} needs one implicit EXEC read and one implicit EXEC write"
         )
+    if _rule_kind(form) == "image":
+        # The MIMG operand set is fixed by the image contract: a written VDATA,
+        # a read address tuple and the read resource and sampler descriptors.
+        # Their variable widths (VADDR is 2 or 3 f32 components, SRSRC 4 or 8
+        # SGPRs) are validated by the decoder, not through the ALU field rules.
+        actual = set(operands)
+        if actual != {"VDATA", "VADDR", "SRSRC", "SSAMP"}:
+            errors.append(f"{label}: XML image operands {sorted(actual)} are not VDATA/VADDR/SRSRC/SSAMP")
+        else:
+            if operands["VDATA"][:3] != ("FMT_ANY", "OPR_VGPR", 128) or operands["VDATA"][3:] != (False, True):
+                errors.append(f"{label}: VDATA must be a written 128-bit VGPR")
+            if operands["VADDR"][3:] != (True, False):
+                errors.append(f"{label}: VADDR must be a read address input")
+            if operands["SRSRC"][1:] != ("OPR_SREG_NONULL", 256, True, False):
+                errors.append(f"{label}: SRSRC must be a read 256-bit aligned SGPR")
+            if operands["SSAMP"][1:] != ("OPR_SREG_NONULL", 128, True, False):
+                errors.append(f"{label}: SSAMP must be a read 128-bit aligned SGPR")
+        return
     if rule is None:
         return
     if not _well_formed(rule):
@@ -925,9 +1000,20 @@ def _check_xml(form, rule, snapshot, errors):
 
 def _identifier(encoding, opcode):
     fields = dict((name, ranges) for name, ranges in encoding["fields"])
-    (offset, size), = fields["OP"]
-    base = encoding["identifiers"][0] & ~(((1 << size) - 1) << offset)
-    return base | (opcode << offset)
+    ranges = fields["OP"]
+    base = encoding["identifiers"][0]
+    if len(ranges) == 1:
+        (offset, size), = ranges
+        base &= ~(((1 << size) - 1) << offset)
+        return base | (opcode << offset)
+    # Split OP field (MIMG): the XML lists the ranges high-bits-first, so the
+    # first range holds the low opcode bits and the second the high bit(s).
+    (offset, size), (high_offset, high_size) = ranges
+    base &= ~(((1 << size) - 1) << offset)
+    base &= ~(((1 << high_size) - 1) << high_offset)
+    low = opcode & ((1 << size) - 1)
+    high = opcode >> size
+    return base | (low << offset) | (high << high_offset)
 
 
 def validate(registry, snapshot):
@@ -948,6 +1034,16 @@ def validate(registry, snapshot):
             errors.append(f"unknown document {name}")
         elif document != PINNED_DOCUMENTS[name]:
             errors.append(f"document {name}: differs from the pinned public document")
+    deferred = registry.get("append_after_variants", [])
+    if not isinstance(deferred, list) or any(not isinstance(family, str) for family in deferred):
+        errors.append("append_after_variants must be an array of family names")
+    elif len(set(deferred)) != len(deferred):
+        errors.append("append_after_variants names a family twice")
+    else:
+        declared_families = {form.get("family") for form in registry.get("form", [])}
+        for family in deferred:
+            if family not in declared_families:
+                errors.append(f"append_after_variants: unknown family {family!r}")
     if "guide" not in documents:
         errors.append("the guide document is not declared")
     rules = registry.get("operand_rules", {})
@@ -1025,9 +1121,15 @@ def validate(registry, snapshot):
                 errors.append(f"{label}: duplicate {key} {shown}")
             seen[key].add(value)
         if (
-            (form["operation"] in LOGICAL and form["signedness"] != "bitwise")
-            or (form["operation"] in ARITHMETIC and form["signedness"] == "bitwise")
-            or ((form["operation"] in FLOAT_ROUNDING) != (form["signedness"] == "float"))
+            # #818: an image sample operation carries no ALU signedness.
+            form["operation"] not in IMAGE_OPERATIONS
+            and (
+                (form["operation"] in LOGICAL and form["signedness"] != "bitwise")
+                or (form["operation"] in ARITHMETIC and form["signedness"] == "bitwise")
+                or (form["operation"] in FLOAT_ROUNDING and form["signedness"] != "float")
+                # #784: float signedness also admits the VOP2 binary32 arithmetic.
+                or (form["signedness"] == "float" and form["operation"] not in FLOAT_OPERATIONS)
+            )
         ):
             errors.append(
                 f"{label}: signedness {form['signedness']} contradicts operation {form['operation']}"
@@ -1113,6 +1215,16 @@ def validate(registry, snapshot):
             }[_rule_kind(form)]
             lowering = table.get(key)
             primitive = None if lowering is None else ("unchanged", lowering, False)
+        elif _rule_kind(form) == "image":
+            if RELATION_KEY in form:
+                errors.append(f"{label}: {RELATION_KEY} on an image sample operation")
+            if form["operation"] not in IMAGE_OPERATIONS:
+                errors.append(f"{label}: image rule requires an image sample operation")
+            if form["signedness"] != "float":
+                errors.append(f"{label}: image sample requires float signedness")
+            # Image samples write no SCC, VCC or EXEC and have no primitive.rs
+            # function; behaviour is the MIMG contract, not a shared primitive.
+            primitive = ("unchanged", None, False)
         else:
             if RELATION_KEY in form:
                 errors.append(f"{label}: {RELATION_KEY} on a non-compare operation")
@@ -1147,6 +1259,7 @@ def validate(registry, snapshot):
             else "vector" if _rule_kind(form) == "vector" and form["operation"] not in UNARY
             else "control" if form["operation"] in CONTROL_OPERATIONS
             else "immediate" if _rule_kind(form) == "immediate"
+            else "image" if form["operation"] in IMAGE_OPERATIONS
             else "alu"
         ):
             errors.append(f"{label}: operation {form['operation']} does not fit rule {form['operands']}")
@@ -1331,8 +1444,19 @@ def _check_spec(label, spec, documents, errors):
 def render(registry, snapshot):
     """Return the complete generated Rust source. Requires a valid registry."""
     forms = registry["form"]
-    rule_names = sorted({form["operands"] for form in forms})
-    positions = {form["name"]: position for position, form in enumerate(forms)}
+    # A family listed in append_after_variants is placed after the encoding
+    # variants, so adding it does not move any pre-existing form or variant
+    # index. Everything else keeps registry order.
+    deferred = set(registry.get("append_after_variants", []))
+    base_forms = [form for form in forms if form["family"] not in deferred]
+    deferred_forms = [form for form in forms if form["family"] in deferred]
+    enum_forms = base_forms + deferred_forms
+    variants = registry.get("encoding_variant", [])
+    variant_rows = [variant_row(registry, variant) for variant in variants]
+    positions = {form["name"]: position for position, form in enumerate(base_forms)}
+    for offset, form in enumerate(deferred_forms):
+        positions[form["name"]] = len(base_forms) + len(variant_rows) + offset
+    rule_names = sorted({form["operands"] for form in enum_forms})
     out = [
         "// @generated by crates/isa/generate_semantics.py from crates/isa/semantics/rdna2.toml.",
         "// Do not edit. Regenerate: python3 crates/isa/generate_semantics.py generate",
@@ -1356,20 +1480,25 @@ def render(registry, snapshot):
         if enum in rendered:
             continue
         rendered.add(enum)
-        selected = [form for form in forms if OPERAND_RULES[form["operands"]]["enum"] == enum]
+        selected = [
+            form for form in enum_forms if OPERAND_RULES[form["operands"]]["enum"] == enum
+        ]
         out += _render_enum(rule_name, selected, snapshot, positions)
-    variants = registry.get("encoding_variant", [])
     variant_positions = {
-        (variant["of"], variant["family"]): len(forms) + index for index, variant in enumerate(variants)
+        (variant["of"], variant["family"]): len(base_forms) + index
+        for index, variant in enumerate(variants)
     }
     for rule_name in sorted({variant["operands"] for variant in variants}):
         selected = [variant for variant in variants if variant["operands"] == rule_name]
         out += _render_variants(rule_name, selected, registry, snapshot, variant_positions)
-    # Encoding variants follow the forms, as rows of their own.
-    forms = forms + [variant_row(registry, variant) for variant in variants]
+    # Encoding variants follow the forms, as rows of their own. Deferred
+    # families are appended after them so pre-existing indices stay stable.
+    forms = base_forms + variant_rows + deferred_forms
     out += [
         "",
-        "/// Identity of every registry form and encoding variant, in registry order.",
+        "/// Identity of every registry form and encoding variant; a family named in",
+        "/// append_after_variants follows the encoding variants to keep existing",
+        "/// positions stable, and the rest keep registry order.",
         f"pub const FORM_IDS: [(&str, EncodingFamily); {len(forms)}] = [",
     ]
     for form in forms:
@@ -1503,9 +1632,99 @@ def _render_variants(rule_name, variants, registry, snapshot, positions):
     return out
 
 
+def _render_image_enum(rule_name, forms, snapshot, positions):
+    """One MIMG image-sample enum with the split OP field and the fixed 2D bits.
+
+    MIMG spreads its 8-bit opcode across bit 0 (the high bit) and bits 24:18
+    (the low seven bits), so the generic `from_word` that reads a contiguous OP
+    field does not apply. The bounded scope fixes NSA, DIM, R128 and every
+    cache/modifier flag; DMASK stays a variable field the decoder validates.
+    """
+    enum = OPERAND_RULES[rule_name]["enum"]
+    family = forms[0]["family"]
+    encoding = snapshot["encodings"][_family_encoding(family)]
+    (offset, size), (low_offset, low_size) = dict(
+        (name, ranges) for name, ranges in encoding["fields"]
+    )["OP"]
+    if (offset, size, low_offset, low_size) != (18, 7, 0, 1):
+        raise ValueError(f"{family}: unexpected split OP field {encoding['fields']['OP']!r}")
+    # The generic `from_word` reads a contiguous OP field; MIMG instead spreads
+    # its opcode across bit 0 (the high bit) and bits 24:18 (the low seven
+    # bits). `from_word` matches only the ENCODING bits and dispatches on the
+    # opcode; the DIM, R128, NSA, DMASK and modifier flags are validated by the
+    # decoder's image operand rule, so a wrong dimension stays `UnsupportedForm`.
+    fixed_mask = 0xFC00_0000
+    fixed_bits = 0xF000_0000
+    out = [
+        "",
+        f"/// {family} image samples declared in the semantic registry (operand rule `{rule_name}`).",
+        "#[derive(Clone, Copy, Debug, Eq, PartialEq)]",
+        f"pub enum {enum} {{",
+    ]
+    for form in forms:
+        out += [
+            f"    /// `{form['name'].lower()}` ({family} opcode {form['opcode']}).",
+            f"    {form['variant']},",
+        ]
+    by_opcode = {form["opcode"]: form["variant"] for form in forms}
+    out += [
+        "}",
+        "",
+        f"impl {enum} {{",
+        f"    /// Every operation, in registry order.",
+        f"    pub const ALL: [Self; {len(forms)}] = [",
+    ]
+    out += [f"        Self::{form['variant']}," for form in forms]
+    out += [
+        "    ];",
+        "",
+        f"    /// Selects the operation from the first word of its {family} encoding:",
+        f"    /// the encoding bits (mask 0x{fixed_mask:09_x}) and then the split OP field",
+        f"    /// (bits {offset}-{offset + size - 1} for the low bits and bit",
+        f"    /// {low_offset} for the high bit). `None` for undeclared opcodes. The DIM,",
+        "    /// R128, NSA, DMASK and modifier flags are checked separately by the decoder.",
+        "    pub const fn from_word(word: u32) -> Option<Self> {",
+        f"        if word & 0x{fixed_mask:09_x} != 0x{fixed_bits:09_x} {{",
+        "            return None;",
+        "        }",
+        f"        let opcode = ((word >> {offset}) & 0x{(1 << size) - 1:x})",
+        f"            | ((word & 0x{(1 << low_size) - 1:x}) << {size});",
+        "        match opcode {",
+    ]
+    for form in sorted(forms, key=lambda form: form["opcode"]):
+        out.append(f"            {form['opcode']} => Some(Self::{form['variant']}),")
+    out += [
+        "            _ => None,",
+        "        }",
+        "    }",
+        "",
+        "    /// Lower-case mnemonic.",
+        "    pub const fn mnemonic(self) -> &'static str {",
+        "        match self {",
+    ]
+    out += [f"            Self::{form['variant']} => \"{form['name'].lower()}\"," for form in forms]
+    out += [
+        "        }",
+        "    }",
+        "",
+        "    /// The validated registry row.",
+        "    pub fn semantics(self) -> &'static FormSemantics {",
+        "        &FORMS[match self {",
+    ]
+    out += [f"            Self::{form['variant']} => {positions[form['name']]}," for form in forms]
+    out += [
+        "        }]",
+        "    }",
+        "}",
+    ]
+    return out
+
+
 def _render_enum(rule_name, forms, snapshot, positions):
     enum = OPERAND_RULES[rule_name]["enum"]
     kind = OPERAND_RULES[rule_name]["kind"]
+    if kind == "image":
+        return _render_image_enum(rule_name, forms, snapshot, positions)
     rules = sorted({form["operands"] for form in forms})
     if any(OPERAND_RULES[name]["kind"] != kind for name in rules):
         raise ValueError(f"{enum}: operand rules {rules} of one enum differ in kind")

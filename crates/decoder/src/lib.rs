@@ -3,14 +3,14 @@
 use std::fmt;
 
 pub use xenora_isa::{
-    Architecture, CompareRelation, ExportTarget, Instruction, InterpolationPhase, ScalarAluOp,
-    ScalarCompareOp, ScalarImmediateCompareOp, ScalarImmediateOp, ScalarSource, ScalarUnaryOp,
-    SoppControlOp, VectorAluOp, VectorAluVop3Op, VectorCompareOp, VectorCompareVop3Op,
-    VectorSource, VectorSwapOp, VectorUnaryOp,
+    Architecture, CompareRelation, ExportTarget, ImageSampleOp, Instruction, InterpolationPhase,
+    ScalarAluOp, ScalarCompareOp, ScalarImmediateCompareOp, ScalarImmediateOp, ScalarSource,
+    ScalarUnaryOp, SoppControlOp, VectorAluOp, VectorAluVop3Op, VectorCompareOp,
+    VectorCompareVop3Op, VectorSource, VectorSwapOp, VectorUnaryOp,
 };
 use xenora_isa::{
-    BUFFER_LOAD_DWORD, BUFFER_STORE_DWORD, EXP, IMAGE_SAMPLE_LZ, S_WAITCNT_VSCNT, V_ADD_F32,
-    V_INTERP_P1_F32, V_INTERP_P2_F32, V_MOV_B32, V_MUL_F32, VCC_LO,
+    BUFFER_LOAD_DWORD, BUFFER_STORE_DWORD, EXP, S_WAITCNT_VSCNT, V_INTERP_P1_F32, V_INTERP_P2_F32,
+    V_MOV_B32, VCC_LO,
 };
 
 use xenora_isa::meta::EncodingFamily;
@@ -40,20 +40,17 @@ const fn concat_forms<const N: usize>() -> [(&'static str, EncodingFamily); N] {
 }
 
 /// Decoded forms not yet described by the semantic registry.
-const HANDWRITTEN_FORMS: [(&str, EncodingFamily); 13] = [
+const HANDWRITTEN_FORMS: [(&str, EncodingFamily); 10] = [
     ("BUFFER_LOAD_DWORD", EncodingFamily::Mubuf),
     ("BUFFER_STORE_DWORD", EncodingFamily::Mubuf),
     ("EXP", EncodingFamily::Exp),
-    ("IMAGE_SAMPLE_LZ", EncodingFamily::Mimg),
     ("S_BUFFER_LOAD_DWORD", EncodingFamily::Smem),
     ("S_BUFFER_LOAD_DWORDX2", EncodingFamily::Smem),
     ("S_BUFFER_LOAD_DWORDX4", EncodingFamily::Smem),
     ("S_WAITCNT_VSCNT", EncodingFamily::Sopk),
-    ("V_ADD_F32", EncodingFamily::Vop2),
     ("V_INTERP_P1_F32", EncodingFamily::Vintrp),
     ("V_INTERP_P2_F32", EncodingFamily::Vintrp),
     ("V_MOV_B32", EncodingFamily::Vop1),
-    ("V_MUL_F32", EncodingFamily::Vop2),
 ];
 
 /// A successfully decoded instruction and its location in the input stream.
@@ -278,17 +275,27 @@ fn decode_gfx1030(bytes: &[u8], offset: usize) -> Result<(Instruction, u8), Deco
         };
         return Ok((Instruction::Export { target, sources }, len));
     }
-    if IMAGE_SAMPLE_LZ.matches(first) {
-        let len = IMAGE_SAMPLE_LZ.byte_len();
+    if let Some(op) = ImageSampleOp::from_word(first) {
+        // Non-NSA MIMG is two dwords; the form never takes a literal.
+        let len = 8;
         let second = word(bytes, len)?;
-        let (dst, coord, resource, sampler) =
-            image_sample_operands(first, second, "image_sample_lz")?;
+        let (dst, coord, resource, sampler, dmask) = image_sample_operands(first, second, op)?;
         return Ok((
-            Instruction::ImageSampleLz {
-                dst,
-                coord,
-                resource,
-                sampler,
+            match op {
+                ImageSampleOp::ImageSampleLz => Instruction::ImageSampleLz {
+                    dst,
+                    coord,
+                    resource,
+                    sampler,
+                    dmask,
+                },
+                ImageSampleOp::ImageSampleL => Instruction::ImageSampleL {
+                    dst,
+                    coord,
+                    resource,
+                    sampler,
+                    dmask,
+                },
             },
             len,
         ));
@@ -466,6 +473,15 @@ fn decode_gfx1030(bytes: &[u8], offset: usize) -> Result<(Instruction, u8), Deco
             OperandRule::Vop2Vgpr | OperandRule::Vop2Vcc => {
                 vector_src0(first, bytes, op.assembly_name())?
             }
+            // Operand rule `vop2_f32`: the guide does not define how a binary32
+            // form reads an integer inline constant (selectors 128-208).
+            OperandRule::Vop2F32 if matches!(first & 0x1ff, 128..=208) => {
+                return Err(unsupported(
+                    op.assembly_name(),
+                    "expected a VGPR, normal SGPR, vcc_lo or literal binary32 source",
+                ));
+            }
+            OperandRule::Vop2F32 => vector_src0(first, bytes, op.assembly_name())?,
             _ => unreachable!("non-VOP2 operand rule for VOP2 instruction"),
         };
         return Ok((
@@ -476,20 +492,6 @@ fn decode_gfx1030(bytes: &[u8], offset: usize) -> Result<(Instruction, u8), Deco
                 src1,
             },
             len,
-        ));
-    }
-    if V_ADD_F32.matches(first) {
-        let (dst, src0, src1) = vop2_registers(first, "v_add_f32_e32")?;
-        return Ok((
-            Instruction::VectorAddF32 { dst, src0, src1 },
-            V_ADD_F32.byte_len(),
-        ));
-    }
-    if V_MUL_F32.matches(first) {
-        let (dst, src0, src1) = vop2_registers(first, "v_mul_f32_e32")?;
-        return Ok((
-            Instruction::VectorMulF32 { dst, src0, src1 },
-            V_MUL_F32.byte_len(),
         ));
     }
     if S_WAITCNT_VSCNT.matches(first) {
@@ -582,47 +584,32 @@ fn vop2_registers(first: u32, mnemonic: &'static str) -> Result<(u8, u8, u8), De
 fn image_sample_operands(
     first: u32,
     second: u32,
-    mnemonic: &'static str,
-) -> Result<(u8, u8, u8, u8), DecodeErrorKind> {
-    // In word 0:
-    // Bits 1..2: NSA (must be 0 for contiguous VADDR)
-    // Bits 3..5: DIM (1 = SQ_RSRC_IMG_2D)
-    // Bit 7: DLC (0)
-    // Bits 8..11: DMASK (0xf for RGBA 4-component return)
-    // Bit 12: UNORM (0)
-    // Bit 13: GLC (0)
-    // Bit 14: DA (0)
-    // Bit 15: R128 (0)
-    // Bit 16: TFE (0)
-    // Bit 25: SLC (0)
-    // Bit 0 & Bits 18..24: OP (0x27 / 39)
-    // Bits 26..31: ENCODING (0x3c)
-    // Mask off OP and ENCODING (bits 0, 18..24, 26..31).
-    // The expected variable bits for 2D RGBA8 sampling:
-    // dim = 1 (bits 3..5 = 1 << 3 = 0x8), dmask = 0xf (bits 8..11 = 0xf << 8 = 0xf00).
-    // All other modifier flags (NSA, DLC, UNORM, GLC, DA, R128, TFE, SLC) must be zero.
-    const MODIFIER_MASK: u32 = 0x0203_fffe;
-    const EXPECTED_2D_RGBA: u32 = 0x0000_0f08;
-
-    if first & MODIFIER_MASK != EXPECTED_2D_RGBA {
+    op: ImageSampleOp,
+) -> Result<(u8, u8, u8, u8, u8), DecodeErrorKind> {
+    let mnemonic = op.mnemonic();
+    // The generated `from_word` dispatch matches the encoding and opcode; the
+    // bounded 2D scope is enforced here. Fixed bits: NSA 0 (1-2), DIM 1 = 2D
+    // (3-5), reserved bit 6 and DLC (7) clear, UNORM/GLC/DA/R128/TFE/LWE clear
+    // (12-17) and SLC clear (25). The data mask (8-11) and opcode stay variable.
+    const MIMG_FIXED_MASK: u32 = 0x0203_f0fe;
+    const MIMG_FIXED_2D: u32 = 0x0000_0008;
+    if first & MIMG_FIXED_MASK != MIMG_FIXED_2D {
         return Err(unsupported(
             mnemonic,
-            "expected dim:SQ_RSRC_IMG_2D and dmask:0xf with zero modifier flags",
+            "expected dim:SQ_RSRC_IMG_2D with zero modifier flags",
         ));
     }
-
-    // In word 1:
-    // Bits 0..7: VADDR (u8)
-    // Bits 8..15: VDATA (u8)
-    // Bits 16..20: SRSRC >> 2 (5 bits)
-    // Bits 21..25: SSAMP >> 2 (5 bits)
-    // Bits 26..29: reserved (must be 0)
-    // Bit 30: A16 (0)
-    // Bit 31: D16 (0)
+    let dmask = ((first >> 8) & 0xf) as u8;
+    if dmask == 0 {
+        return Err(unsupported(mnemonic, "expected a nonzero data mask"));
+    }
+    // In word 1: bits 0..7 are VADDR, 8..15 VDATA, 16..20 SRSRC (>> 2) and
+    // 21..25 SSAMP (>> 2). The reserved bits 26..29 and the A16/D16 flags must
+    // be clear.
     if second & 0xfc00_0000 != 0 {
         return Err(unsupported(
             mnemonic,
-            "expected 32-bit float coordinates and data without A16/D16",
+            "expected 32-bit coordinates and data without A16/D16",
         ));
     }
 
@@ -631,8 +618,23 @@ fn image_sample_operands(
     let resource = (((second >> 16) & 0x1f) * 4) as u8;
     let sampler = (((second >> 21) & 0x1f) * 4) as u8;
 
-    // RDNA 2 resource descriptor (T#) requires 8 SGPRs; sampler (S#) requires 4 SGPRs.
-    // SGPR range is 0..=105 for normal allocatable registers.
+    // One destination VGPR per DMASK-selected component.
+    let components = u16::from(dmask.count_ones() as u8);
+    if u16::from(dst) + components - 1 > 255 {
+        return Err(unsupported(mnemonic, "destination span exceeds v255"));
+    }
+    // The address tuple is (u, v) for LZ and (u, v, lod) for L.
+    let address_components: u16 = match op {
+        ImageSampleOp::ImageSampleLz => 2,
+        ImageSampleOp::ImageSampleL => 3,
+    };
+    if u16::from(coord) + address_components - 1 > 255 {
+        return Err(unsupported(mnemonic, "coordinate tuple exceeds v255"));
+    }
+
+    // The RDNA 2 resource descriptor (T#) spans eight SGPRs and the sampler
+    // (S#) four, both four-aligned (guide 8.2, printed page 69); the range is
+    // s[0:105] for normal allocatable SGPRs.
     if resource > 98 {
         return Err(unsupported(
             mnemonic,
@@ -646,7 +648,7 @@ fn image_sample_operands(
         ));
     }
 
-    Ok((dst, coord, resource, sampler))
+    Ok((dst, coord, resource, sampler, dmask))
 }
 
 /// SOPP `s_waitcnt lgkmcnt(0)` alone: the other counters at their maximum.

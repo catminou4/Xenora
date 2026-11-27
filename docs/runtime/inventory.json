@@ -5624,6 +5624,16 @@
       "api_set": true,
       "canonical_kind": "name",
       "canonical_library": "ucrtbase.dll",
+      "canonical_symbol": "__stdio_common_vfscanf",
+      "kind": "name",
+      "library": "api-ms-win-crt-stdio-l1-1-0.dll",
+      "status": "partial",
+      "symbol": "__stdio_common_vfscanf"
+    },
+    {
+      "api_set": true,
+      "canonical_kind": "name",
+      "canonical_library": "ucrtbase.dll",
       "canonical_symbol": "__stdio_common_vsprintf",
       "kind": "name",
       "library": "api-ms-win-crt-stdio-l1-1-0.dll",
@@ -7184,6 +7194,16 @@
       "api_set": false,
       "canonical_kind": "name",
       "canonical_library": "ucrtbase.dll",
+      "canonical_symbol": "_chdir",
+      "kind": "name",
+      "library": "msvcrt.dll",
+      "status": "implemented",
+      "symbol": "_chdir"
+    },
+    {
+      "api_set": false,
+      "canonical_kind": "name",
+      "canonical_library": "ucrtbase.dll",
       "canonical_symbol": "_close",
       "kind": "name",
       "library": "msvcrt.dll",
@@ -7304,6 +7324,16 @@
       "api_set": false,
       "canonical_kind": "name",
       "canonical_library": "ucrtbase.dll",
+      "canonical_symbol": "_fullpath",
+      "kind": "name",
+      "library": "msvcrt.dll",
+      "status": "partial",
+      "symbol": "_fullpath"
+    },
+    {
+      "api_set": false,
+      "canonical_kind": "name",
+      "canonical_library": "ucrtbase.dll",
       "canonical_symbol": "_get_errno",
       "kind": "name",
       "library": "msvcrt.dll",
@@ -7319,6 +7349,16 @@
       "library": "msvcrt.dll",
       "status": "implemented",
       "symbol": "_get_osfhandle"
+    },
+    {
+      "api_set": false,
+      "canonical_kind": "name",
+      "canonical_library": "ucrtbase.dll",
+      "canonical_symbol": "_getcwd",
+      "kind": "name",
+      "library": "msvcrt.dll",
+      "status": "implemented",
+      "symbol": "_getcwd"
     },
     {
       "api_set": false,
@@ -8607,6 +8647,20 @@
         "source": "manual",
         "status": "implemented",
         "symbol": "vfprintf"
+      },
+      {
+        "kind": "name",
+        "library": "ucrtbase.dll",
+        "source": "manual",
+        "status": "implemented",
+        "symbol": "_chdir"
+      },
+      {
+        "kind": "name",
+        "library": "ucrtbase.dll",
+        "source": "manual",
+        "status": "implemented",
+        "symbol": "_getcwd"
       },
       {
         "kind": "name",
@@ -12842,6 +12896,16 @@
       "source": "typed",
       "status": "partial",
       "status_explicit": true,
+      "symbol": "__stdio_common_vfscanf"
+    },
+    {
+      "data_import": false,
+      "family": "c-runtime",
+      "kind": "name",
+      "library": "ucrtbase.dll",
+      "source": "typed",
+      "status": "partial",
+      "status_explicit": true,
       "symbol": "__stdio_common_vsprintf"
     },
     {
@@ -12913,6 +12977,16 @@
       "status": "partial",
       "status_explicit": true,
       "symbol": "_cexit"
+    },
+    {
+      "data_import": false,
+      "family": "c-runtime",
+      "kind": "name",
+      "library": "ucrtbase.dll",
+      "source": "manual",
+      "status": "implemented",
+      "status_explicit": false,
+      "symbol": "_chdir"
     },
     {
       "data_import": false,
@@ -13183,6 +13257,16 @@
       "status": "implemented",
       "status_explicit": true,
       "symbol": "_get_osfhandle"
+    },
+    {
+      "data_import": false,
+      "family": "c-runtime",
+      "kind": "name",
+      "library": "ucrtbase.dll",
+      "source": "manual",
+      "status": "implemented",
+      "status_explicit": false,
+      "symbol": "_getcwd"
     },
     {
       "data_import": false,
@@ -15596,6 +15680,56 @@
     },
     {
       "data_import": false,
+      "family": "other",
+      "kind": "name",
+      "library": "winhttp.dll",
+      "source": "manual",
+      "status": "partial",
+      "status_explicit": true,
+      "symbol": "WinHttpQueryDataAvailable"
+    },
+    {
+      "data_import": false,
+      "family": "other",
+      "kind": "name",
+      "library": "winhttp.dll",
+      "source": "manual",
+      "status": "partial",
+      "status_explicit": true,
+      "symbol": "WinHttpQueryHeaders"
+    },
+    {
+      "data_import": false,
+      "family": "other",
+      "kind": "name",
+      "library": "winhttp.dll",
+      "source": "manual",
+      "status": "partial",
+      "status_explicit": true,
+      "symbol": "WinHttpReadData"
+    },
+    {
+      "data_import": false,
+      "family": "other",
+      "kind": "name",
+      "library": "winhttp.dll",
+      "source": "manual",
+      "status": "partial",
+      "status_explicit": true,
+      "symbol": "WinHttpReceiveResponse"
+    },
+    {
+      "data_import": false,
+      "family": "other",
+      "kind": "name",
+      "library": "winhttp.dll",
+      "source": "manual",
+      "status": "partial",
+      "status_explicit": true,
+      "symbol": "WinHttpSendRequest"
+    },
+    {
+      "data_import": false,
       "family": "windows-networking",
       "kind": "name",
       "library": "ws2_32.dll",
@@ -16946,21 +17080,21 @@
     }
   ],
   "summary": {
-    "aliases": 832,
-    "api_set_aliases": 702,
-    "canonical_services": 809,
+    "aliases": 836,
+    "api_set_aliases": 703,
+    "canonical_services": 781,
     "data_import_services": 7,
     "duplicate_registrations": 0,
-    "implemented": 216,
-    "implicit_status_services": 74,
-    "libraries": 20,
-    "manual_services": 558,
+    "implemented": 218,
+    "implicit_status_services": 76,
+    "libraries": 15,
+    "manual_services": 529,
     "ordinal_aliases": 0,
-    "partial": 590,
+    "partial": 559,
     "structural_consistency_findings": 0,
-    "stub": 3,
-    "typed_registry_entries": 251,
-    "typed_services": 251,
+    "stub": 4,
+    "typed_registry_entries": 252,
+    "typed_services": 252,
     "wanted_imports": null,
     "wanted_missing": null
   },

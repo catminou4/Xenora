@@ -40,6 +40,126 @@ pub struct DbtMetrics {
     pub service_calls: usize,
 }
 
+/// Counters for direct block linking.
+///
+/// They are kept apart from [`DbtMetrics`], whose fields other tools list one
+/// by one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkMetrics {
+    /// Links the dispatcher installed from a static successor of a block to
+    /// the full block it selected next for that address.
+    pub links_installed: usize,
+    /// Block transitions made by following a link in native code, without
+    /// returning to the dispatcher.
+    pub links_followed: usize,
+    /// Exits at a static successor that returned to the dispatcher instead:
+    /// no link yet, a target not verified in the current epoch, too little
+    /// budget left, or a chain that had to stop.
+    pub link_fallbacks: usize,
+    /// Times the verification epoch advanced. Each makes every link target
+    /// unverified until the dispatcher selects and checks it again.
+    pub epochs: usize,
+    /// Link targets retired because their guest bytes changed. A retired
+    /// target is never entered through a link again.
+    pub targets_retired: usize,
+    /// Guest code bytes the dispatcher compared to confirm its cache hits.
+    /// A followed link skips this check.
+    pub bytes_verified: usize,
+}
+
+/// The verification epoch of a retired link target. Live epochs start at 1.
+const RETIRED_EPOCH: u64 = 0;
+
+/// The epoch a chain takes once no further link may be followed. No target
+/// is ever verified in it.
+const STOPPED_EPOCH: u64 = u64::MAX;
+
+/// Where a link enters a translated full block. Read by the exit stubs of the
+/// blocks linked to it.
+#[repr(C)]
+struct LinkTarget {
+    /// The engine epoch in which the dispatcher last selected this block for
+    /// `start` and found its guest bytes unchanged, or [`RETIRED_EPOCH`].
+    verified_epoch: u64,
+    /// Guest address of the block's first instruction.
+    start: u64,
+    /// Host address of the block's first instruction after the prologue.
+    body: u64,
+}
+
+/// One static successor of a block: the guest address control reaches and the
+/// target installed for it, or 0.
+#[repr(C)]
+struct LinkSlot {
+    target: u64,
+    rip: u64,
+}
+
+const TARGET_EPOCH_OFFSET: u32 = std::mem::offset_of!(LinkTarget, verified_epoch) as u32;
+const TARGET_START_OFFSET: u32 = std::mem::offset_of!(LinkTarget, start) as u32;
+const TARGET_BODY_OFFSET: u32 = std::mem::offset_of!(LinkTarget, body) as u32;
+const SLOT_TARGET_OFFSET: u32 = std::mem::offset_of!(LinkSlot, target) as u32;
+
+/// The link records of one translated full block.
+struct BlockLinks {
+    target: LinkTarget,
+    /// A block has at most two static successors, both sides of a `Jcc`.
+    slots: [LinkSlot; 2],
+}
+
+/// Owner of every [`BlockLinks`]. Emitted code embeds their host addresses and
+/// slots point at them, so each lives at a fixed address until the engine,
+/// with its code cache, is dropped. They are allocated in chunks, so
+/// translating a block does not allocate.
+#[derive(Default)]
+struct LinkArena {
+    chunks: Vec<*mut [BlockLinks]>,
+    /// Records handed out from the last chunk.
+    used: usize,
+}
+
+const LINK_CHUNK: usize = 64;
+
+impl LinkArena {
+    fn allocate(&mut self, start: u64) -> *mut BlockLinks {
+        if self.chunks.is_empty() || self.used == LINK_CHUNK {
+            let chunk: Box<[BlockLinks]> = (0..LINK_CHUNK)
+                .map(|_| BlockLinks {
+                    target: LinkTarget {
+                        verified_epoch: RETIRED_EPOCH,
+                        start: 0,
+                        body: 0,
+                    },
+                    slots: [
+                        LinkSlot { target: 0, rip: 0 },
+                        LinkSlot { target: 0, rip: 0 },
+                    ],
+                })
+                .collect();
+            self.chunks.push(Box::into_raw(chunk));
+            self.used = 0;
+        }
+        let chunk = self.chunks[self.chunks.len() - 1];
+        // SAFETY: `used` < LINK_CHUNK, so the record is inside the chunk,
+        // and no other pointer to it has been handed out.
+        unsafe {
+            let links = chunk.cast::<BlockLinks>().add(self.used);
+            (*links).target.start = start;
+            self.used += 1;
+            links
+        }
+    }
+}
+
+impl Drop for LinkArena {
+    fn drop(&mut self) {
+        for chunk in self.chunks.drain(..) {
+            // SAFETY: each chunk came from `Box::into_raw` and is freed once.
+            drop(unsafe { Box::from_raw(chunk) });
+        }
+    }
+}
+
 /// A translated block and the guest bytes it was translated from.
 ///
 /// A cached block is only valid while those bytes are still executable at the
@@ -49,6 +169,15 @@ struct CachedBlock {
     code: *const u8,
     start: u64,
     source: Box<[u8]>,
+    /// Link records of a full block; null for a budget-limited one.
+    links: *mut BlockLinks,
+}
+
+/// A block the dispatcher selected: its entry point and, for a full block,
+/// its link records.
+struct SelectedBlock {
+    code: *const u8,
+    links: *mut BlockLinks,
 }
 
 impl CachedBlock {
@@ -61,6 +190,36 @@ impl CachedBlock {
 }
 
 /// Dynamic Binary Translator and native execution runtime.
+///
+/// # Direct block linking
+///
+/// A full block whose last instruction has static successors (the next
+/// instruction after a block that ends at the instruction quota, the target
+/// of a relative `JMP` or `CALL`, both sides of a `Jcc`) ends with an exit
+/// stub. The stub may jump straight to the translated block of that successor
+/// instead of returning to the dispatcher. Links are words in host data
+/// memory, read by the stub; emitted code is never rewritten.
+///
+/// The stub follows a link only when all of these hold:
+///
+/// - the target block starts at the guest address control reaches;
+/// - in the current verification epoch, the dispatcher selected that block
+///   for its address after its trampoline and service checks, and either
+///   translated it or found its guest bytes unchanged;
+/// - after this block, enough of the budget is left that the dispatcher would
+///   also select a full block: [`MAX_BLOCK_INSTRUCTIONS`] for [`Self::run`],
+///   one instruction for a slice;
+/// - nothing in the chain recorded an exit or a fault, stored into the range
+///   of guest addresses that cached blocks were translated from, or ran an
+///   instruction through the shared semantics, which may write anywhere.
+///
+/// The epoch advances at the start of every run, since the host may change
+/// guest memory or pass another address space between runs, and within a run
+/// after every service call, trampoline dispatch and fault dispatch, and after
+/// any block that ended a chain for one of the reasons in the last point. A
+/// block translated again because its bytes changed has its link target
+/// retired for good. Every other transition goes through the dispatcher, which
+/// keeps its lookup and byte check.
 pub struct DbtEngine {
     jit: JitMemory,
     block_cache: HashMap<u64, CachedBlock>,
@@ -68,9 +227,18 @@ pub struct DbtEngine {
     assembler: Arm64Assembler,
     /// Decoded instructions that emitted helper calls point into.
     decoded_blocks: Vec<Box<[Insn]>>,
+    links: LinkArena,
+    /// Current verification epoch; see the type documentation.
+    epoch: u64,
+    /// Guest addresses that every cached block was translated from lie in
+    /// `code_start..code_end`. Empty while nothing is cached.
+    code_start: u64,
+    code_end: u64,
+    linking: bool,
     services: HashMap<u64, HostServiceFn>,
     pub import_registry: Option<crate::imports::ImportRegistry>,
     pub metrics: DbtMetrics,
+    pub link_metrics: LinkMetrics,
     /// Exit status of a guest that ended its process on this engine.
     exited: Option<u32>,
 }
@@ -84,11 +252,32 @@ impl DbtEngine {
             limited_block_cache: HashMap::new(),
             assembler: Arm64Assembler::new(),
             decoded_blocks: Vec::new(),
+            links: LinkArena::default(),
+            epoch: RETIRED_EPOCH,
+            code_start: u64::MAX,
+            code_end: 0,
+            linking: true,
             services: HashMap::new(),
             import_registry: None,
             metrics: DbtMetrics::default(),
+            link_metrics: LinkMetrics::default(),
             exited: None,
         })
+    }
+
+    /// Enable or disable direct block linking; it is enabled by default.
+    /// Disabled, every block returns to the dispatcher, as before linking
+    /// existed, and no link is installed or followed.
+    pub fn set_block_linking(&mut self, enabled: bool) {
+        self.linking = enabled;
+    }
+
+    /// Make every link target unverified until the dispatcher selects and
+    /// checks it again.
+    fn advance_epoch(&mut self) {
+        // A u64 does not wrap back to RETIRED_EPOCH within any real run.
+        self.epoch += 1;
+        self.link_metrics.epochs += 1;
     }
 
     /// Attach an import registry for automatic IAT trampoline dispatch.
@@ -162,6 +351,12 @@ impl DbtEngine {
         exact: bool,
     ) -> ExecutionResult {
         let mut instructions_count = 0;
+        // The host may have changed guest memory since the last run, or
+        // passed another address space.
+        self.advance_epoch();
+        // The slot a block's exit stub could not follow, for the block the
+        // dispatcher selects next.
+        let mut missed_slot: *mut LinkSlot = std::ptr::null_mut();
 
         while instructions_count < max_instructions {
             // Check if current RIP is an attached import registry trampoline
@@ -169,7 +364,12 @@ impl DbtEngine {
                 && registry.is_service_trampoline(cpu.rip)
             {
                 self.metrics.service_calls += 1;
-                if let Err(reason) = registry.dispatch(cpu.rip, cpu, memory) {
+                let dispatched = registry.dispatch(cpu.rip, cpu, memory);
+                // A service may change guest memory, its mappings and the
+                // trampolines themselves.
+                self.advance_epoch();
+                missed_slot = std::ptr::null_mut();
+                if let Err(reason) = dispatched {
                     return ExecutionResult {
                         instructions_executed: instructions_count,
                         final_state: cpu.clone(),
@@ -183,7 +383,10 @@ impl DbtEngine {
             // Check if current RIP is a registered host service
             if let Some(service) = self.services.get(&cpu.rip) {
                 self.metrics.service_calls += 1;
-                if let Err(reason) = service(cpu, memory) {
+                let served = service(cpu, memory);
+                self.advance_epoch();
+                missed_slot = std::ptr::null_mut();
+                if let Err(reason) = served {
                     return ExecutionResult {
                         instructions_executed: instructions_count,
                         final_state: cpu.clone(),
@@ -214,12 +417,15 @@ impl DbtEngine {
             {
                 block = self.get_or_compile_block(cpu.rip, memory, 1);
             }
-            let block_fn_ptr = match block {
-                Ok(ptr) => ptr,
+            let selected = match block {
+                Ok(selected) => selected,
                 Err(reason) => {
                     // A fetch or decode fault of a guest instruction may be
                     // caught by the guest's own exception handlers.
-                    let exit = match crate::exceptions::dispatch_fault(reason, true, cpu, memory) {
+                    let dispatched = crate::exceptions::dispatch_fault(reason, true, cpu, memory);
+                    self.advance_epoch();
+                    missed_slot = std::ptr::null_mut();
+                    let exit = match dispatched {
                         Ok(()) => {
                             instructions_count += 1;
                             continue;
@@ -233,16 +439,35 @@ impl DbtEngine {
                     };
                 }
             };
+            let slot = std::mem::replace(&mut missed_slot, std::ptr::null_mut());
+            self.install_link(slot, &selected, cpu.rip);
 
             // Execute native ARM64 translated block!
             // Signature: extern "C" fn(cpu_state_ptr: *mut u64, guest_memory_ctx: *mut (GuestMemory, ExitReason)) -> u32
-            // Returns: number of guest instructions executed in this block
+            // Returns: number of guest instructions executed in the block
+            // that returned. Each link followed before it used up the
+            // length of the block it left from `BlockContext::headroom`.
             type BlockFn = unsafe extern "C" fn(*mut u64, *mut BlockContext) -> u32;
-            let block_fn: BlockFn = unsafe { std::mem::transmute(block_fn_ptr) };
+            let block_fn: BlockFn = unsafe { std::mem::transmute(selected.code) };
 
+            // After a block, the dispatcher would select a full block again
+            // only with a whole block of budget left for `run`, and with any
+            // budget left for a slice.
+            let remaining = max_instructions - instructions_count;
+            let headroom = match (self.linking, exact) {
+                (false, _) => 0,
+                (true, true) => remaining.saturating_sub(MAX_BLOCK_INSTRUCTIONS),
+                (true, false) => remaining - 1,
+            } as u64;
             let mut ctx = BlockContext {
                 memory_ptr: memory as *mut GuestMemory,
                 faulted: 0,
+                epoch: self.epoch,
+                headroom,
+                links_followed: 0,
+                missed_slot: 0,
+                code_start: self.code_start,
+                code_end: self.code_end,
                 exit_reason: None,
                 helper_instructions: 0,
             };
@@ -250,9 +475,16 @@ impl DbtEngine {
             self.metrics.dbt_dispatches += 1;
             let cpu_raw_ptr = cpu as *mut CpuState as *mut u64;
             let insns_in_block = unsafe { block_fn(cpu_raw_ptr, &mut ctx) };
-            instructions_count += insns_in_block as usize;
-            self.metrics.instructions_executed += insns_in_block as usize;
+            let executed = (headroom - ctx.headroom) as usize + insns_in_block as usize;
+            instructions_count += executed;
+            self.metrics.instructions_executed += executed;
             self.metrics.interpreter_fallbacks += ctx.helper_instructions as usize;
+            self.link_metrics.links_followed += ctx.links_followed as usize;
+            if ctx.epoch != self.epoch || ctx.exit_reason.is_some() {
+                // Guest code may have changed, or a fault dispatch may write
+                // guest memory next.
+                self.advance_epoch();
+            }
 
             if let Some(exit) = ctx.exit_reason {
                 // A guest instruction's fault may be caught by the guest's
@@ -267,6 +499,10 @@ impl DbtEngine {
                     exit_reason: exit,
                 };
             }
+            if ctx.missed_slot != 0 {
+                self.link_metrics.link_fallbacks += 1;
+                missed_slot = ctx.missed_slot as *mut LinkSlot;
+            }
         }
 
         ExecutionResult {
@@ -276,25 +512,68 @@ impl DbtEngine {
         }
     }
 
+    /// Point `slot`, which a block's exit stub could not follow, at the block
+    /// the dispatcher then selected, when that is a full block for the
+    /// slot's own successor address.
+    fn install_link(&mut self, slot: *mut LinkSlot, selected: &SelectedBlock, rip: u64) {
+        if slot.is_null() || selected.links.is_null() || !self.linking {
+            return;
+        }
+        // SAFETY: slots and targets are owned by `self.links` and outlive
+        // this call; no translated code runs while the dispatcher holds them.
+        unsafe {
+            if (*slot).rip != rip || (*selected.links).target.start != rip {
+                return;
+            }
+            let target = std::ptr::addr_of!((*selected.links).target) as u64;
+            if (*slot).target != target {
+                (*slot).target = target;
+                self.link_metrics.links_installed += 1;
+            }
+        }
+    }
+
     fn get_or_compile_block(
         &mut self,
         rip: u64,
         memory: &GuestMemory,
         block_limit: usize,
-    ) -> Result<*const u8, ExitReason> {
+    ) -> Result<SelectedBlock, ExitReason> {
         if block_limit == MAX_BLOCK_INSTRUCTIONS {
             if let Some(cached) = self.block_cache.get(&rip) {
                 if cached.is_current(memory) {
                     self.metrics.cache_hits += 1;
-                    return Ok(cached.code);
+                    self.link_metrics.bytes_verified += cached.source.len();
+                    if !cached.links.is_null() {
+                        // SAFETY: owned by `self.links`; no translated code
+                        // runs while the dispatcher selects a block.
+                        unsafe { (*cached.links).target.verified_epoch = self.epoch };
+                    }
+                    return Ok(SelectedBlock {
+                        code: cached.code,
+                        links: cached.links,
+                    });
+                }
+                // Blocks linked to the old translation fall back to the
+                // dispatcher from now on. A stale block stays cached when its
+                // new translation fails, so it is retired only once.
+                // SAFETY: as above.
+                if !cached.links.is_null()
+                    && unsafe { (*cached.links).target.verified_epoch } != RETIRED_EPOCH
+                {
+                    unsafe { (*cached.links).target.verified_epoch = RETIRED_EPOCH };
+                    self.link_metrics.targets_retired += 1;
                 }
                 self.metrics.blocks_invalidated += 1;
             }
             self.metrics.cache_misses += 1;
             let compiled = self.compile_block(rip, memory, block_limit)?;
-            let code = compiled.code;
+            let selected = SelectedBlock {
+                code: compiled.code,
+                links: compiled.links,
+            };
             self.block_cache.insert(rip, compiled);
-            return Ok(code);
+            return Ok(selected);
         }
 
         // Keep budget-limited blocks separate so they cannot shorten a later run.
@@ -302,15 +581,22 @@ impl DbtEngine {
         if let Some(cached) = self.limited_block_cache.get(&key) {
             if cached.is_current(memory) {
                 self.metrics.cache_hits += 1;
-                return Ok(cached.code);
+                self.link_metrics.bytes_verified += cached.source.len();
+                return Ok(SelectedBlock {
+                    code: cached.code,
+                    links: std::ptr::null_mut(),
+                });
             }
             self.metrics.blocks_invalidated += 1;
         }
         self.metrics.cache_misses += 1;
         let compiled = self.compile_block(rip, memory, block_limit)?;
-        let code = compiled.code;
+        let selected = SelectedBlock {
+            code: compiled.code,
+            links: std::ptr::null_mut(),
+        };
         self.limited_block_cache.insert(key, compiled);
-        Ok(code)
+        Ok(selected)
     }
 
     fn compile_block(
@@ -355,6 +641,10 @@ impl DbtEngine {
         asm.mov_reg_64(X19, X0);
         // Keep BlockContext pointer in callee-saved X20
         asm.mov_reg_64(X20, X1);
+        // A link enters here, in the frame and with the X19 and X20 of the
+        // first block of its chain. Every block has the same prologue and
+        // epilogue, so any of them can return from that frame.
+        let body = asm.current_offset();
 
         let mut emitter = Emitter {
             asm,
@@ -375,6 +665,20 @@ impl DbtEngine {
             asm.load_imm_64(X9, rip);
             asm.str_uoff_64(X9, X19, RIP_OFFSET);
         }
+
+        // Only full blocks link, from and to: a budget-limited block is
+        // selected only when less than a full block of budget is left. Every
+        // full block can be a target, whatever its own last instruction.
+        let links = if block_limit == MAX_BLOCK_INSTRUCTIONS {
+            let links = self.links.allocate(start_rip);
+            let (successors, count) = static_successors(&insns, rip);
+            if count > 0 {
+                emit_link_exit(asm, links, &successors[..count], insns.len() as u64);
+            }
+            links
+        } else {
+            std::ptr::null_mut()
+        };
 
         // Return number of guest instructions executed in this block in X0
         asm.load_imm_64(X0, insns.len() as u64);
@@ -403,12 +707,119 @@ impl DbtEngine {
             .collect::<Result<Box<[u8]>, _>>()
             .map_err(ExitReason::MemoryFault)?;
         self.decoded_blocks.push(insns);
+        // Stores into these bytes must end a chain from now on.
+        self.code_start = self.code_start.min(start_rip);
+        self.code_end = self.code_end.max(rip);
+        if !links.is_null() {
+            // SAFETY: owned by `self.links`; the emitted code is not running.
+            unsafe {
+                (*links).target.body = emitted as u64 + body as u64 * 4;
+                (*links).target.verified_epoch = self.epoch;
+            }
+        }
         Ok(CachedBlock {
             code: emitted,
             start: start_rip,
             source,
+            links,
         })
     }
+}
+
+/// Guest addresses a block's last instruction passes control to that are
+/// known when it is translated, in the order its exit stub tests them, and
+/// how many there are. `next` is the address after the block.
+fn static_successors(insns: &[Insn], next: u64) -> ([u64; 2], usize) {
+    let Some(last) = insns.last() else {
+        return ([0; 2], 0);
+    };
+    if !last.op.is_terminator() {
+        // The block ended at the instruction quota.
+        return ([next, 0], 1);
+    }
+    if !is_native(last) || last.encoding != Encoding::Rel {
+        // RET, indirect branches and terminators run by the shared
+        // semantics go through the dispatcher.
+        return ([0; 2], 0);
+    }
+    match last.op {
+        Op::Jmp | Op::Call => ([last.imm, 0], 1),
+        Op::Jcc if last.imm == next => ([next, 0], 1),
+        Op::Jcc => ([last.imm, next], 2),
+        _ => ([0; 2], 0),
+    }
+}
+
+/// Emit the exit stub of a full block with static successors. It follows the
+/// link of the successor that the guest RIP names when the conditions in the
+/// [`DbtEngine`] documentation hold. Otherwise it records that slot for the
+/// dispatcher and falls through to the block's ordinary return of `len`.
+fn emit_link_exit(asm: &mut Arm64Assembler, links: *mut BlockLinks, successors: &[u64], len: u64) {
+    // SAFETY: `links` is live and nothing else refers to its slots yet.
+    let slots = unsafe { &mut (*links).slots };
+    asm.ldr_uoff_64(X9, X19, RIP_OFFSET);
+    // With two successors, the first (a Jcc's target) is tested and the
+    // second is taken otherwise. The start check below still requires the
+    // target to begin at the guest RIP.
+    let mut to_check = None;
+    for (index, (&rip, slot)) in successors.iter().zip(slots.iter_mut()).enumerate() {
+        slot.rip = rip;
+        let address = std::ptr::from_mut(slot) as u64;
+        if index + 1 < successors.len() {
+            asm.load_imm_64(X10, rip);
+            asm.cmp_reg_64(X9, X10);
+            let mismatch = asm.current_offset();
+            asm.b_cond(Condition::Ne, 0);
+            asm.load_imm_64(X11, address);
+            to_check = Some(asm.current_offset());
+            asm.b(0);
+            let next = asm.current_offset();
+            asm.patch_b_cond(mismatch, Condition::Ne, next as i32 - mismatch as i32);
+        } else {
+            asm.load_imm_64(X11, address);
+        }
+    }
+    // X9 = guest RIP, X11 = the slot of that successor.
+    let check = asm.current_offset();
+    if let Some(branch) = to_check {
+        asm.patch_b(branch, check as i32 - branch as i32);
+    }
+    asm.ldr_uoff_64(X12, X11, SLOT_TARGET_OFFSET);
+    let no_target = asm.current_offset();
+    asm.cbz_64(X12, 0);
+    // A stopped chain has STOPPED_EPOCH, in which no target is verified.
+    asm.ldr_uoff_64(X13, X12, TARGET_EPOCH_OFFSET);
+    asm.ldr_uoff_64(X14, X20, BLOCK_CTX_EPOCH_OFFSET);
+    asm.cmp_reg_64(X13, X14);
+    let unverified = asm.current_offset();
+    asm.b_cond(Condition::Ne, 0);
+    asm.ldr_uoff_64(X13, X12, TARGET_START_OFFSET);
+    asm.cmp_reg_64(X13, X9);
+    let elsewhere = asm.current_offset();
+    asm.b_cond(Condition::Ne, 0);
+    // headroom - len, refusing to wrap.
+    asm.ldr_uoff_64(X13, X20, BLOCK_CTX_HEADROOM_OFFSET);
+    asm.load_imm_64(X14, len);
+    asm.subs_reg_64(X13, X13, X14);
+    let over_budget = asm.current_offset();
+    asm.b_cond(Condition::Cc, 0);
+    // Follow the link: charge this block, then enter the target.
+    asm.str_uoff_64(X13, X20, BLOCK_CTX_HEADROOM_OFFSET);
+    asm.ldr_uoff_64(X13, X20, BLOCK_CTX_LINKS_FOLLOWED_OFFSET);
+    asm.add_imm_64(X13, X13, 1);
+    asm.str_uoff_64(X13, X20, BLOCK_CTX_LINKS_FOLLOWED_OFFSET);
+    asm.ldr_uoff_64(X13, X12, TARGET_BODY_OFFSET);
+    asm.br(X13);
+    let exit = asm.current_offset();
+    asm.patch_cbz_64(no_target, X12, exit as i32 - no_target as i32);
+    for (branch, condition) in [
+        (unverified, Condition::Ne),
+        (elsewhere, Condition::Ne),
+        (over_budget, Condition::Cc),
+    ] {
+        asm.patch_b_cond(branch, condition, exit as i32 - branch as i32);
+    }
+    asm.str_uoff_64(X11, X20, BLOCK_CTX_MISSED_SLOT_OFFSET);
 }
 
 const RIP_OFFSET: u32 = std::mem::offset_of!(CpuState, rip) as u32;
@@ -1417,12 +1828,30 @@ fn emit_fault_guard(
     asm.patch_cbz_64(skip, X5, resume as i32 - skip as i32);
 }
 
+/// State shared by the dispatcher and the blocks of one native call: the
+/// block it enters and every block reached from it through links.
 #[repr(C)]
 struct BlockContext {
     memory_ptr: *mut GuestMemory,
     /// Set to 1 by a memory helper when a guest access faults. Translated code
     /// tests this word before committing any further architectural effect.
     faulted: u64,
+    /// The engine's verification epoch for this call, or [`STOPPED_EPOCH`]
+    /// once no further link may be followed: an exit or fault is recorded, a
+    /// store may have written translated guest code, or the shared semantics
+    /// ran. The dispatcher then advances the engine's epoch.
+    epoch: u64,
+    /// Instructions the running block and the blocks after it may still use
+    /// beyond what the dispatcher needs left to select a full block. Following
+    /// a link charges the length of the block it leaves. 0 while linking is
+    /// disabled.
+    headroom: u64,
+    links_followed: u64,
+    /// The [`LinkSlot`] the last exit stub could not follow, or 0.
+    missed_slot: u64,
+    /// See [`DbtEngine::code_start`].
+    code_start: u64,
+    code_end: u64,
     exit_reason: Option<ExitReason>,
     /// Instructions executed through [`execute_helper`].
     helper_instructions: u64,
@@ -1430,6 +1859,11 @@ struct BlockContext {
 
 const BLOCK_CTX_FAULTED_OFFSET: u32 = 8;
 const _: () = assert!(std::mem::offset_of!(BlockContext, faulted) == 8);
+const BLOCK_CTX_EPOCH_OFFSET: u32 = std::mem::offset_of!(BlockContext, epoch) as u32;
+const BLOCK_CTX_HEADROOM_OFFSET: u32 = std::mem::offset_of!(BlockContext, headroom) as u32;
+const BLOCK_CTX_LINKS_FOLLOWED_OFFSET: u32 =
+    std::mem::offset_of!(BlockContext, links_followed) as u32;
+const BLOCK_CTX_MISSED_SLOT_OFFSET: u32 = std::mem::offset_of!(BlockContext, missed_slot) as u32;
 
 fn check_guest_address(ctx: *mut BlockContext, address: u64, size: u8) -> bool {
     if x86_exec::canonical_access(address, size) {
@@ -1437,6 +1871,17 @@ fn check_guest_address(ctx: *mut BlockContext, address: u64, size: u8) -> bool {
     }
     fault(ctx, ExitReason::GeneralProtection);
     false
+}
+
+/// End the chain before a guest store that may write bytes some cached block
+/// was translated from. The range is conservative: it also covers data
+/// between translated blocks.
+fn note_store(ctx: *mut BlockContext, address: u64, size: u64) {
+    unsafe {
+        if address < (*ctx).code_end && address.saturating_add(size) > (*ctx).code_start {
+            (*ctx).epoch = STOPPED_EPOCH;
+        }
+    }
 }
 
 extern "C" fn write_u64_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
@@ -1447,10 +1892,10 @@ extern "C" fn write_u64_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if !check_guest_address(ctx, addr, 8) {
             return;
         }
+        note_store(ctx, addr, 8);
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u64(addr, val) {
-            (*ctx).faulted = 1;
-            (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+            fault(ctx, ExitReason::MemoryFault(e));
         }
     }
 }
@@ -1467,8 +1912,7 @@ extern "C" fn read_u64_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
         match mem.read_u64(addr) {
             Ok(v) => v,
             Err(e) => {
-                (*ctx).faulted = 1;
-                (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+                fault(ctx, ExitReason::MemoryFault(e));
                 0
             }
         }
@@ -1500,6 +1944,14 @@ fn load_helper(size: u8) -> u64 {
 fn fault(ctx: *mut BlockContext, reason: ExitReason) {
     unsafe {
         (*ctx).faulted = 1;
+        record_exit(ctx, reason);
+    }
+}
+
+/// Record an exit that ends the native call, so no link is followed after it.
+fn record_exit(ctx: *mut BlockContext, reason: ExitReason) {
+    unsafe {
+        (*ctx).epoch = STOPPED_EPOCH;
         (*ctx).exit_reason = Some(reason);
     }
 }
@@ -1530,6 +1982,7 @@ extern "C" fn write_u128_helper(ctx: *mut BlockContext, addr: u64, value: u128) 
     if !check_guest_address(ctx, addr, 16) {
         return;
     }
+    note_store(ctx, addr, 16);
     let memory = unsafe { &mut *(*ctx).memory_ptr };
     if let Err(error) = memory.write_bytes(addr, &value.to_le_bytes()) {
         fault(ctx, ExitReason::MemoryFault(error));
@@ -1548,28 +2001,25 @@ extern "C" fn write_aligned_u128_helper(ctx: *mut BlockContext, addr: u64, value
 extern "C" fn execute_helper(ctx: *mut BlockContext, cpu: *mut CpuState, insn: *const Insn) {
     unsafe {
         (*ctx).helper_instructions += 1;
+        // The shared semantics may store anywhere, translated code included,
+        // without passing through `note_store`.
+        (*ctx).epoch = STOPPED_EPOCH;
         match x86_exec::execute(&mut *cpu, &mut *(*ctx).memory_ptr, &*insn) {
             Ok(None) => {}
-            Ok(Some(reason)) => (*ctx).exit_reason = Some(reason),
-            Err(reason) => {
-                (*ctx).faulted = 1;
-                (*ctx).exit_reason = Some(reason);
-            }
+            Ok(Some(reason)) => record_exit(ctx, reason),
+            Err(reason) => fault(ctx, reason),
         }
     }
 }
 
 /// Push `value` below `sp` and return the new stack pointer.
 extern "C" fn push_helper(ctx: *mut BlockContext, sp: u64, value: u64) -> u64 {
-    unsafe {
-        let Some(address) = sp.checked_sub(8) else {
-            (*ctx).faulted = 1;
-            (*ctx).exit_reason = Some(ExitReason::StackUnderflow);
-            return sp;
-        };
-        write_u64_helper(ctx, address, value);
-        address
-    }
+    let Some(address) = sp.checked_sub(8) else {
+        fault(ctx, ExitReason::StackUnderflow);
+        return sp;
+    };
+    write_u64_helper(ctx, address, value);
+    address
 }
 
 extern "C" fn write_u16_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
@@ -1580,10 +2030,10 @@ extern "C" fn write_u16_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if !check_guest_address(ctx, addr, 2) {
             return;
         }
+        note_store(ctx, addr, 2);
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u16(addr, val as u16) {
-            (*ctx).faulted = 1;
-            (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+            fault(ctx, ExitReason::MemoryFault(e));
         }
     }
 }
@@ -1596,10 +2046,10 @@ extern "C" fn write_u32_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if !check_guest_address(ctx, addr, 4) {
             return;
         }
+        note_store(ctx, addr, 4);
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u32(addr, val as u32) {
-            (*ctx).faulted = 1;
-            (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+            fault(ctx, ExitReason::MemoryFault(e));
         }
     }
 }
@@ -1616,8 +2066,7 @@ extern "C" fn read_u32_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
         match mem.read_u32(addr) {
             Ok(v) => u64::from(v),
             Err(e) => {
-                (*ctx).faulted = 1;
-                (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+                fault(ctx, ExitReason::MemoryFault(e));
                 0
             }
         }
@@ -1632,10 +2081,10 @@ extern "C" fn write_u8_helper(ctx: *mut BlockContext, addr: u64, val: u64) {
         if !check_guest_address(ctx, addr, 1) {
             return;
         }
+        note_store(ctx, addr, 1);
         let mem = &mut *(*ctx).memory_ptr;
         if let Err(e) = mem.write_u8(addr, val as u8) {
-            (*ctx).faulted = 1;
-            (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+            fault(ctx, ExitReason::MemoryFault(e));
         }
     }
 }
@@ -1652,8 +2101,7 @@ extern "C" fn read_u8_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
         match mem.read_u8(addr) {
             Ok(v) => v as u64,
             Err(e) => {
-                (*ctx).faulted = 1;
-                (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+                fault(ctx, ExitReason::MemoryFault(e));
                 0
             }
         }
@@ -1672,8 +2120,7 @@ extern "C" fn read_u16_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
         match mem.read_u16(addr) {
             Ok(v) => v as u64,
             Err(e) => {
-                (*ctx).faulted = 1;
-                (*ctx).exit_reason = Some(ExitReason::MemoryFault(e));
+                fault(ctx, ExitReason::MemoryFault(e));
                 0
             }
         }
@@ -1682,8 +2129,8 @@ extern "C" fn read_u16_helper(ctx: *mut BlockContext, addr: u64) -> u64 {
 
 extern "C" fn set_exit_reason_helper(ctx: *mut BlockContext, code: u64) {
     unsafe {
-        if code == 1 {
-            (*ctx).exit_reason.get_or_insert(ExitReason::Halt);
+        if code == 1 && (*ctx).exit_reason.is_none() {
+            record_exit(ctx, ExitReason::Halt);
         }
     }
 }
@@ -2810,5 +3257,487 @@ mod tests {
                 assert_eq!(engine.metrics.interpreter_fallbacks, 0);
             }
         }
+    }
+
+    // Direct block linking. Every program below is written for these tests;
+    // each runs on the interpreter and on fresh engines with and without links.
+
+    const LINK_DATA: u64 = 0x8000;
+    const LINK_DATA_LEN: usize = 0x40;
+    const LINK_STACK_TOP: u64 = 0x3_0000;
+
+    /// `code` at ENTRY, a small data region and a stack, all outside the code.
+    fn link_memory(code: &[u8], permissions: MemoryPermissions) -> GuestMemory {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region_with_data(ENTRY, code.len(), permissions, code)
+            .unwrap();
+        let data: Vec<u8> = (0..LINK_DATA_LEN as u8).collect();
+        memory
+            .map_region_with_data(
+                LINK_DATA,
+                LINK_DATA_LEN,
+                MemoryPermissions::READ_WRITE,
+                &data,
+            )
+            .unwrap();
+        memory
+            .map_region(
+                LINK_STACK_TOP - 0x1000,
+                0x1000,
+                MemoryPermissions::READ_WRITE,
+            )
+            .unwrap();
+        memory
+    }
+
+    /// One engine's run: its result, the data and stack bytes, and the link
+    /// counters (all zero for the interpreter).
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        exit_reason: ExitReason,
+        instructions_executed: usize,
+        final_state: CpuState,
+        data: Vec<u8>,
+        stack: Vec<u8>,
+    }
+
+    fn outcome(result: ExecutionResult, memory: &GuestMemory) -> Outcome {
+        Outcome {
+            exit_reason: result.exit_reason,
+            instructions_executed: result.instructions_executed,
+            final_state: result.final_state,
+            data: region_bytes(memory, LINK_DATA, LINK_DATA_LEN),
+            stack: region_bytes(memory, LINK_STACK_TOP - 0x1000, 0x1000),
+        }
+    }
+
+    fn link_cpu() -> CpuState {
+        CpuState::new(ENTRY, LINK_STACK_TOP)
+    }
+
+    fn interpreted(code: &[u8], permissions: MemoryPermissions, budget: usize) -> Outcome {
+        let mut memory = link_memory(code, permissions);
+        let result = crate::cpu::Interpreter::new(link_cpu(), &mut memory, budget).run();
+        outcome(result, &memory)
+    }
+
+    fn translated(
+        code: &[u8],
+        permissions: MemoryPermissions,
+        budget: usize,
+        linking: bool,
+    ) -> (Outcome, DbtEngine) {
+        let mut memory = link_memory(code, permissions);
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        engine.set_block_linking(linking);
+        let result = engine.run(&mut link_cpu(), &mut memory, budget);
+        (outcome(result, &memory), engine)
+    }
+
+    /// Run `code` three ways, check that they agree, and return the linked
+    /// engine.
+    fn agree_three_ways(code: &[u8], permissions: MemoryPermissions, budget: usize) -> DbtEngine {
+        let expected = interpreted(code, permissions, budget);
+        let (unlinked, unlinked_engine) = translated(code, permissions, budget, false);
+        let (linked, linked_engine) = translated(code, permissions, budget, true);
+        assert_eq!(unlinked, expected, "unlinked DBT, budget {budget}");
+        assert_eq!(linked, expected, "linked DBT, budget {budget}");
+        assert_eq!(unlinked_engine.link_metrics.links_followed, 0);
+        assert_eq!(unlinked_engine.link_metrics.links_installed, 0);
+        linked_engine
+    }
+
+    /// `rel8` from the end of an instruction at `next` to `target`.
+    fn rel8(next: u64, target: u64) -> u8 {
+        let offset = target.wrapping_sub(next) as i64;
+        assert!((-128..=127).contains(&offset));
+        offset as i8 as u8
+    }
+
+    /// mov ecx, count; xor eax, eax; L: add rax, 3; sub rcx, 1; jnz L; hlt.
+    /// 2 + 3 * count + 1 instructions.
+    fn counted_loop(count: u8) -> Vec<u8> {
+        let mut code = vec![0xB9, count, 0, 0, 0, 0x31, 0xC0];
+        let head = ENTRY + code.len() as u64;
+        code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x03, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(next, head));
+        code.push(0xF4);
+        code
+    }
+
+    #[test]
+    fn linked_loop_agrees_with_the_interpreter_and_the_unlinked_dbt() {
+        let code = counted_loop(200);
+        let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, 10_000);
+        let links = engine.link_metrics;
+        // The loop block links to itself once the dispatcher has installed
+        // that link: every later iteration but the last two, whose budget
+        // or exit leaves through the dispatcher, follows it.
+        assert!(links.links_followed >= 190, "{links:?}");
+        assert!(links.links_installed >= 1, "{links:?}");
+        assert_eq!(engine.metrics.interpreter_fallbacks, 0);
+        // Followed links skip the dispatcher, so it entered native code far
+        // fewer times than blocks ran.
+        assert!(engine.metrics.dbt_dispatches < 20, "{:?}", engine.metrics);
+    }
+
+    #[test]
+    fn links_respect_every_exact_budget() {
+        let code = counted_loop(30);
+        let total = 2 + 3 * 30 + 1;
+        for budget in 0..=total + 3 {
+            let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, budget);
+            if budget > 48 {
+                assert!(engine.link_metrics.links_followed > 0, "budget {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_cut_by_the_budget_resumes_to_the_uncut_result() {
+        let code = counted_loop(30);
+        let mut memory = link_memory(&code, MemoryPermissions::READ_EXECUTE);
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        let whole = engine.run(&mut link_cpu(), &mut memory, 1_000);
+        assert_eq!(whole.exit_reason, ExitReason::Halt);
+        for cut in [1, 15, 16, 17, 31, 32, 33, 50, 64, 80] {
+            let mut cpu = link_cpu();
+            let first = engine.run(&mut cpu, &mut memory, cut);
+            assert_eq!(first.exit_reason, ExitReason::StepLimitExceeded);
+            assert_eq!(first.instructions_executed, cut);
+            let rest = engine.run(&mut cpu, &mut memory, 1_000);
+            assert_eq!(rest.exit_reason, ExitReason::Halt);
+            assert_eq!(
+                cut + rest.instructions_executed,
+                whole.instructions_executed
+            );
+            assert_eq!(rest.final_state, whole.final_state);
+        }
+        assert!(engine.link_metrics.links_followed > 0);
+    }
+
+    #[test]
+    fn linked_slices_stop_where_unlinked_slices_stop() {
+        let code = counted_loop(30);
+        for budget in 1..=100 {
+            let mut results = [true, false].map(|linking| {
+                let mut memory = link_memory(&code, MemoryPermissions::READ_EXECUTE);
+                let mut engine = DbtEngine::new(256 * 1024).unwrap();
+                engine.set_block_linking(linking);
+                let result = engine.run_slice(&mut link_cpu(), &mut memory, budget);
+                assert!(result.instructions_executed < budget + MAX_BLOCK_INSTRUCTIONS);
+                (outcome(result, &memory), engine.link_metrics.links_followed)
+            });
+            assert_eq!(results[1].1, 0);
+            // The loop block's link to itself is installed when the
+            // dispatcher selects that block again, on the third pass, and
+            // followed at its end, 5 + 3 + 3 instructions in.
+            if budget > 11 {
+                assert!(results[0].1 > 0, "budget {budget}");
+            }
+            results[0].1 = 0;
+            assert_eq!(results[0], results[1], "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn static_successors_cover_quota_jumps_calls_and_both_branch_sides() {
+        fn successors(code: &[u8]) -> Vec<u64> {
+            let fetch = |address: u64| {
+                let offset = address.wrapping_sub(ENTRY) as usize;
+                code.get(offset)
+                    .copied()
+                    .ok_or(MemoryError::UnmappedAddress(address))
+            };
+            let insn = decode(ENTRY, fetch).unwrap();
+            let (successors, count) = static_successors(&[insn], insn.next_rip());
+            successors[..count].to_vec()
+        }
+        let next = |len: u64| ENTRY + len;
+        assert_eq!(successors(&[0x48, 0x83, 0xC0, 0x01]), [next(4)]); // add rax, 1
+        assert_eq!(successors(&[0xEB, 0x10]), [next(2) + 0x10]); // jmp +16
+        assert_eq!(successors(&[0x75, 0xF0]), [next(2) - 0x10, next(2)]); // jnz -16
+        assert_eq!(successors(&[0x74, 0x00]), [next(2)]); // jz to the next insn
+        assert_eq!(successors(&[0xE8, 0x20, 0, 0, 0]), [next(5) + 0x20]); // call +32
+        assert!(successors(&[0xC3]).is_empty()); // ret
+        assert!(successors(&[0xFF, 0xE0]).is_empty()); // jmp rax
+        assert!(successors(&[0xFF, 0xD0]).is_empty()); // call rax
+        assert!(successors(&[0xF4]).is_empty()); // hlt
+    }
+
+    #[test]
+    fn quota_fallthrough_and_relative_calls_are_linked() {
+        // mov ecx, 5
+        // L: add rax, 1 (20 times; the loop body spans a block quota)
+        //    call F; sub rcx, 1; jnz L; hlt
+        // F: add rbx, 2; ret
+        let mut code = vec![0xB9, 5, 0, 0, 0];
+        let head = ENTRY + code.len() as u64;
+        for _ in 0..20 {
+            code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x01]);
+        }
+        let call = code.len();
+        code.extend_from_slice(&[0xE8, 0, 0, 0, 0, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let jnz_next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(jnz_next, head));
+        code.push(0xF4);
+        let function = code.len() as u32;
+        code[call + 1..call + 5].copy_from_slice(&(function - (call as u32 + 5)).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x83, 0xC3, 0x02, 0xC3]);
+
+        let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, 10_000);
+        let expected = interpreted(&code, MemoryPermissions::READ_EXECUTE, 10_000);
+        assert_eq!(expected.final_state.get(Register::Rax), 100);
+        assert_eq!(expected.final_state.get(Register::Rbx), 10);
+        // From the third iteration on, the quota fallthrough, the call and
+        // the taken branch each follow a link; RET returns through the
+        // dispatcher.
+        assert!(
+            engine.link_metrics.links_followed >= 9,
+            "{:?}",
+            engine.link_metrics
+        );
+    }
+
+    #[test]
+    fn stack_stores_outside_translated_code_keep_links() {
+        // mov ecx, 10; L: push rcx; pop rbx; add rax, rbx; sub rcx, 1; jnz L; hlt
+        let mut code = vec![0xB9, 10, 0, 0, 0];
+        let head = ENTRY + code.len() as u64;
+        code.extend_from_slice(&[0x51, 0x5B, 0x48, 0x01, 0xD8, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(next, head));
+        code.push(0xF4);
+        let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, 1_000);
+        // The first pass runs in the entry block, the second installs the
+        // loop block's link to itself, and passes 4 to 10 enter through it.
+        assert_eq!(
+            engine.link_metrics.links_followed, 7,
+            "{:?}",
+            engine.link_metrics
+        );
+    }
+
+    #[test]
+    fn shared_semantics_instruction_ends_every_chain() {
+        // mov ecx, 10; L: add al, 1; sub rcx, 1; jnz L; hlt. The 8-bit ADD
+        // runs through the shared semantics, which may store anywhere.
+        let mut code = vec![0xB9, 10, 0, 0, 0];
+        let head = ENTRY + code.len() as u64;
+        code.extend_from_slice(&[0x04, 0x01, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(next, head));
+        code.push(0xF4);
+        let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, 1_000);
+        assert_eq!(engine.metrics.interpreter_fallbacks, 10);
+        assert_eq!(engine.link_metrics.links_followed, 0);
+    }
+
+    #[test]
+    fn store_into_a_linked_block_is_translated_again() {
+        // mov ecx, 4; mov edi, IMM; xor eax, eax
+        // B: add rax, imm8 (at IMM); jmp C
+        // C: mov [rdi], cl; sub rcx, 1; jnz B; hlt
+        // Each pass rewrites B's immediate with the counter, then branches
+        // back to B, which the dispatcher verified in the current epoch.
+        let b = ENTRY + 12;
+        let mut code = vec![0xB9, 4, 0, 0, 0, 0xBF];
+        code.extend_from_slice(&((b + 3) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x31, 0xC0, 0x48, 0x83, 0xC0, 0x01, 0xEB, 0x00]);
+        code.extend_from_slice(&[0x88, 0x0F, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(next, b));
+        code.push(0xF4);
+
+        let rwx = MemoryPermissions::READ_WRITE_EXECUTE;
+        let engine = agree_three_ways(&code, rwx, 1_000);
+        let expected = interpreted(&code, rwx, 1_000);
+        // 1 + 4 + 3 + 2: every pass used the immediate the previous one wrote.
+        assert_eq!(expected.final_state.get(Register::Rax), 10);
+        assert!(
+            engine.link_metrics.targets_retired >= 2,
+            "{:?}",
+            engine.link_metrics
+        );
+    }
+
+    #[test]
+    fn link_into_another_address_space_is_not_followed() {
+        // mov ecx, 10; xor eax, eax; jmp L; L: add rax, K; sub rcx, 1; jnz L; hlt
+        let program = |k: u8| {
+            let mut code = vec![0xB9, 10, 0, 0, 0, 0x31, 0xC0, 0xEB, 0x00];
+            let head = ENTRY + code.len() as u64;
+            code.extend_from_slice(&[0x48, 0x83, 0xC0, k, 0x48, 0x83, 0xE9, 0x01, 0x75]);
+            let next = ENTRY + code.len() as u64 + 1;
+            code.push(rel8(next, head));
+            code.push(0xF4);
+            code
+        };
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        for k in [1, 5, 1] {
+            let code = program(k);
+            let mut memory = link_memory(&code, MemoryPermissions::READ_EXECUTE);
+            let followed = engine.link_metrics.links_followed;
+            let result = engine.run(&mut link_cpu(), &mut memory, 1_000);
+            assert_eq!(
+                outcome(result, &memory),
+                interpreted(&code, MemoryPermissions::READ_EXECUTE, 1_000)
+            );
+            assert_eq!(memory.read_u8(ENTRY + 12).unwrap(), k);
+            assert!(engine.link_metrics.links_followed > followed);
+        }
+        // The entry block is the same in both programs; its link to the loop
+        // block was refused, and the loop block was translated again, twice.
+        assert_eq!(engine.link_metrics.targets_retired, 2);
+    }
+
+    #[test]
+    fn host_write_between_runs_is_seen_through_a_link() {
+        // mov ecx, 50; A: add rax, 1; jmp B; B: add rbx, K; sub rcx, 1; jnz A; hlt
+        let code = [
+            0xB9, 50, 0, 0, 0, // mov ecx, 50
+            0x48, 0x83, 0xC0, 0x01, // A: add rax, 1
+            0xEB, 0x00, // jmp B
+            0x48, 0x83, 0xC3, 0x02, // B: add rbx, K
+            0x48, 0x83, 0xE9, 0x01, // sub rcx, 1
+            0x75, 0xF0, // jnz A
+            0xF4, // hlt
+        ];
+        let immediate = ENTRY + 14;
+        let rwx = MemoryPermissions::READ_WRITE_EXECUTE;
+        // 3 entry instructions, then B and 10 passes of A and B: the run
+        // stops at A, whose full block links to B.
+        let cut = 3 + 3 + 10 * 5;
+
+        let mut memory = link_memory(&code, rwx);
+        let first = crate::cpu::Interpreter::new(link_cpu(), &mut memory, cut).run();
+        memory.write_bytes(immediate, &[7]).unwrap();
+        let second = crate::cpu::Interpreter::new(first.final_state, &mut memory, 1_000).run();
+        let expected = outcome(second, &memory);
+
+        let mut memory = link_memory(&code, rwx);
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        let mut cpu = link_cpu();
+        let first = engine.run(&mut cpu, &mut memory, cut);
+        assert_eq!(first.exit_reason, ExitReason::StepLimitExceeded);
+        assert_eq!(cpu.rip, ENTRY + 5);
+        assert!(engine.link_metrics.links_followed > 0);
+        // The host rewrites B while the engine is between runs.
+        memory.write_bytes(immediate, &[7]).unwrap();
+        let second = engine.run(&mut cpu, &mut memory, 1_000);
+        assert_eq!(outcome(second, &memory), expected);
+        assert_eq!(engine.link_metrics.targets_retired, 1);
+    }
+
+    #[test]
+    fn service_registered_at_a_linked_target_runs() {
+        // mov ecx, 3; L: add rax, 1; jmp S; S: sub rcx, 1; jnz L; hlt
+        let code = [
+            0xB9, 3, 0, 0, 0, // mov ecx, 3
+            0x48, 0x83, 0xC0, 0x01, // L: add rax, 1
+            0xEB, 0x00, // jmp S
+            0x48, 0x83, 0xE9, 0x01, // S: sub rcx, 1
+            0x75, 0xF4, // jnz L
+            0xF4, // hlt
+        ];
+        let service = ENTRY + 11;
+        let hlt = ENTRY + 17;
+        let mut memory = link_memory(&code, MemoryPermissions::READ_EXECUTE);
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        let first = engine.run(&mut link_cpu(), &mut memory, 1_000);
+        assert_eq!(first.final_state.get(Register::Rax), 3);
+        assert!(engine.link_metrics.links_followed > 0);
+
+        engine.register_service(service, move |cpu, _| {
+            cpu.set(Register::Rbx, 0x5E);
+            cpu.rip = hlt;
+            Ok(())
+        });
+        let second = engine.run(&mut link_cpu(), &mut memory, 1_000);
+        assert_eq!(second.exit_reason, ExitReason::Halt);
+        assert_eq!(second.final_state.get(Register::Rax), 1);
+        assert_eq!(second.final_state.get(Register::Rbx), 0x5E);
+        assert_eq!(engine.metrics.service_calls, 1);
+    }
+
+    #[test]
+    fn service_that_rewrites_code_ends_the_epoch() {
+        // mov ecx, 5; B: add rbx, K; call SVC; R: sub rcx, 1; jnz B; hlt.
+        // The service returns to R and increments K, the immediate of B,
+        // which R's link enters next.
+        const SERVICE: u64 = 0x1100;
+        let mut code = vec![0xB9, 5, 0, 0, 0, 0x48, 0x83, 0xC3, 0x01, 0xE8];
+        let call_next = ENTRY + code.len() as u64 + 4;
+        code.extend_from_slice(&(SERVICE.wrapping_sub(call_next) as u32).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x83, 0xE9, 0x01, 0x75]);
+        let next = ENTRY + code.len() as u64 + 1;
+        code.push(rel8(next, ENTRY + 5));
+        code.push(0xF4);
+        let immediate = ENTRY + 8;
+
+        for linking in [true, false] {
+            let mut memory = link_memory(&code, MemoryPermissions::READ_WRITE_EXECUTE);
+            let mut engine = DbtEngine::new(256 * 1024).unwrap();
+            engine.set_block_linking(linking);
+            engine.register_service(SERVICE, move |cpu, memory| {
+                let rsp = cpu.get(Register::Rsp);
+                cpu.rip = memory.read_u64(rsp).map_err(ExitReason::MemoryFault)?;
+                cpu.set(Register::Rsp, rsp + 8);
+                let k = memory.read_u8(immediate).map_err(ExitReason::MemoryFault)?;
+                memory
+                    .write_bytes(immediate, &[k + 1])
+                    .map_err(ExitReason::MemoryFault)?;
+                Ok(())
+            });
+            let result = engine.run(&mut link_cpu(), &mut memory, 1_000);
+            assert_eq!(result.exit_reason, ExitReason::Halt);
+            // 1 + 2 + 3 + 4 + 5: every pass saw the immediate the service wrote.
+            assert_eq!(
+                result.final_state.get(Register::Rbx),
+                15,
+                "linking {linking}"
+            );
+            assert_eq!(engine.metrics.service_calls, 5);
+        }
+    }
+
+    #[test]
+    fn fault_inside_a_chain_reports_the_completed_instructions() {
+        // mov esi, LINK_DATA; L: mov rax, [rsi]; add rsi, 8; jmp L. The ninth
+        // load leaves the data region.
+        let code = [
+            0xBE, 0x00, 0x80, 0x00, 0x00, // mov esi, 0x8000
+            0x48, 0x8B, 0x06, // L: mov rax, [rsi]
+            0x48, 0x83, 0xC6, 0x08, // add rsi, 8
+            0xEB, 0xF7, // jmp L
+        ];
+        let engine = agree_three_ways(&code, MemoryPermissions::READ_EXECUTE, 1_000);
+        let expected = interpreted(&code, MemoryPermissions::READ_EXECUTE, 1_000);
+        assert!(matches!(expected.exit_reason, ExitReason::MemoryFault(_)));
+        assert_eq!(expected.instructions_executed, 1 + 8 * 3);
+        assert_eq!(expected.final_state.rip, ENTRY + 5);
+        assert!(
+            engine.link_metrics.links_followed >= 6,
+            "{:?}",
+            engine.link_metrics
+        );
+    }
+
+    #[test]
+    fn retranslation_does_not_rewrite_emitted_code() {
+        // Linking only writes host data: a warm run emits nothing and keeps
+        // the code cache's committed size.
+        let code = counted_loop(50);
+        let mut memory = link_memory(&code, MemoryPermissions::READ_EXECUTE);
+        let mut engine = DbtEngine::new(256 * 1024).unwrap();
+        engine.run(&mut link_cpu(), &mut memory, 1_000);
+        let (used, emitted) = (engine.jit.used(), engine.metrics.native_bytes_emitted);
+        let followed = engine.link_metrics.links_followed;
+        engine.run(&mut link_cpu(), &mut memory, 1_000);
+        assert_eq!(engine.jit.used(), used);
+        assert_eq!(engine.metrics.native_bytes_emitted, emitted);
+        assert!(engine.link_metrics.links_followed > followed);
     }
 }

@@ -169,18 +169,18 @@ fn rejects_either_out_of_domain_operand_even_if_the_product_is_normal() {
     let subnormal = 0x0000_0001; // 2^-149, yielding exact 2^-23 with large_normal.
     let negative_one = (-1.0f32).to_bits();
     assert_eq!(multiply(large_normal, one), Ok(vec![large_normal]));
-    for (a, b) in [
-        (subnormal, large_normal),
-        (large_normal, subnormal),
-        (negative_one, one),
-        (one, negative_one),
-    ] {
+    // A subnormal operand is outside the domain whatever the product would be.
+    for (a, b) in [(subnormal, large_normal), (large_normal, subnormal)] {
         assert_eq!(
             multiply(a, b),
             Err(ReferenceError {
                 offset: 16,
-                detail: "float operation outside positive, normal, exact binary32 domain",
+                detail: "binary32 operand or result outside domain",
             })
         );
     }
+    // The guide's rule has no sign restriction (guide 12.7, page 131), so a
+    // negative operand is multiplied like any other.
+    assert_eq!(multiply(negative_one, one), Ok(vec![negative_one]));
+    assert_eq!(multiply(one, negative_one), Ok(vec![negative_one]));
 }

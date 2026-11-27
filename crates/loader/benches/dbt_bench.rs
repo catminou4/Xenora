@@ -9,7 +9,9 @@
 //! so `XENORA_DBT_BENCH_BUILD_LABEL=<text>` records a label of your choosing
 //! for them.
 //!
-//! Set `XENORA_DBT_BENCH_COMPARE=<baseline.json>,<candidate.json>` to compare
+//! Set `XENORA_DBT_BENCH_WORKLOAD` to `add-chain` (the default),
+//! `branch-loop` or `checked-memory` to select the original synthetic guest
+//! workload. Set `XENORA_DBT_BENCH_COMPARE=<baseline.json>,<candidate.json>` to compare
 //! two such documents instead of running the benchmark. The comparison is
 //! refused, with exit status 1, unless both runs used the same host, workload,
 //! build settings and sample counts.
@@ -97,14 +99,86 @@ fn build_pe(code: &[u8]) -> Vec<u8> {
 }
 
 const ADDS: usize = 10_000;
-const INSTRUCTIONS: usize = ADDS + 2;
+const BRANCH_ITERATIONS: usize = 5_000;
+const MEMORY_ITERATIONS: usize = 2_000;
 const BUDGET: usize = 20_000;
 const STACK_TOP: u64 = 0x2000_8000;
+const DATA_BASE: u64 = 0x2000_4000;
 
-fn check(result: ExecutionResult) {
+/// One original synthetic guest workload. The instruction count includes HLT.
+#[derive(Debug)]
+struct Workload {
+    name: &'static str,
+    code: Vec<u8>,
+    instructions: usize,
+    final_rax: u64,
+}
+
+fn add_chain() -> Workload {
+    let mut code = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, 0
+    for _ in 0..ADDS {
+        code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x01]); // add rax, 1
+    }
+    code.push(0xF4); // hlt
+    Workload {
+        name: "add-chain",
+        code,
+        instructions: ADDS + 2,
+        final_rax: ADDS as u64,
+    }
+}
+
+fn branch_loop() -> Workload {
+    let mut code = vec![0x48, 0xB8];
+    code.extend_from_slice(&(BRANCH_ITERATIONS as u64).to_le_bytes()); // mov rax, iterations
+    let sub_at = code.len();
+    code.extend_from_slice(&[0x48, 0x83, 0xE8, 0x01]); // sub rax, 1
+    let after_jump = code.len() + 2;
+    let displacement = (sub_at as isize - after_jump as isize) as i8;
+    code.extend_from_slice(&[0x75, displacement as u8]); // jne the subtraction
+    code.push(0xF4); // hlt
+    Workload {
+        name: "branch-loop",
+        code,
+        instructions: 1 + BRANCH_ITERATIONS * 2 + 1,
+        final_rax: 0,
+    }
+}
+
+fn checked_memory() -> Workload {
+    let mut code = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, 0
+    code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, DATA_BASE
+    code.extend_from_slice(&DATA_BASE.to_le_bytes());
+    for _ in 0..MEMORY_ITERATIONS {
+        code.extend_from_slice(&[0x89, 0x01]); // mov [rcx], eax
+        code.extend_from_slice(&[0x8B, 0x01]); // mov eax, [rcx]
+        code.extend_from_slice(&[0x83, 0xC0, 0x01]); // add eax, 1
+        code.extend_from_slice(&[0x48, 0x83, 0xC1, 0x04]); // add rcx, 4
+    }
+    code.push(0xF4); // hlt
+    Workload {
+        name: "checked-memory",
+        code,
+        instructions: 2 + MEMORY_ITERATIONS * 4 + 1,
+        final_rax: MEMORY_ITERATIONS as u64,
+    }
+}
+
+fn workload(name: Option<&str>) -> Result<Workload, String> {
+    match name.unwrap_or("add-chain") {
+        "add-chain" => Ok(add_chain()),
+        "branch-loop" => Ok(branch_loop()),
+        "checked-memory" => Ok(checked_memory()),
+        other => Err(format!(
+            "unknown workload `{other}`; expected add-chain, branch-loop or checked-memory"
+        )),
+    }
+}
+
+fn check(result: ExecutionResult, workload: &Workload) {
     assert_eq!(result.exit_reason, ExitReason::Halt);
-    assert_eq!(result.instructions_executed, INSTRUCTIONS);
-    assert_eq!(result.final_state.get(Register::Rax), ADDS as u64);
+    assert_eq!(result.instructions_executed, workload.instructions);
+    assert_eq!(result.final_state.get(Register::Rax), workload.final_rax);
 }
 
 fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
@@ -128,7 +202,7 @@ struct Summary {
     mips: f64,
 }
 
-fn summarize(samples: &mut [Duration]) -> Summary {
+fn summarize(samples: &mut [Duration], guest_instructions: usize) -> Summary {
     samples.sort_unstable();
     let median = percentile(samples, 0.50);
     Summary {
@@ -139,7 +213,7 @@ fn summarize(samples: &mut [Duration]) -> Summary {
         p95: percentile(samples, 0.95),
         p99: percentile(samples, 0.99),
         iqr: percentile(samples, 0.75) - percentile(samples, 0.25),
-        mips: INSTRUCTIONS as f64 / median.as_secs_f64() / 1_000_000.0,
+        mips: guest_instructions as f64 / median.as_secs_f64() / 1_000_000.0,
     }
 }
 
@@ -255,6 +329,7 @@ fn json_summary(s: &Summary) -> String {
 
 fn json_document(
     info: &RunInfo,
+    workload: &Workload,
     interpreter: &Summary,
     cold: &Summary,
     warm: &Summary,
@@ -291,8 +366,8 @@ fn json_document(
         (
             "workload",
             json_object(&[
-                ("name", json_string("add_rax_chain")),
-                ("guest_instructions", INSTRUCTIONS.to_string()),
+                ("name", json_string(workload.name)),
+                ("guest_instructions", workload.instructions.to_string()),
                 ("guest_code_bytes", info.guest_code_bytes.to_string()),
                 ("instruction_budget", BUDGET.to_string()),
                 ("warmup_rounds", info.warmup.to_string()),
@@ -802,13 +877,15 @@ fn main() {
     let warmup_count = std::env::var("XENORA_DBT_BENCH_WARMUP")
         .map_or(10, |value| value.parse::<usize>().expect("warmup count"));
 
-    let mut code = vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0]; // mov rax, 0
-    for _ in 0..ADDS {
-        code.extend_from_slice(&[0x48, 0x83, 0xC0, 0x01]); // add rax, 1
-    }
-    code.push(0xF4); // hlt
+    let workload = match workload(std::env::var("XENORA_DBT_BENCH_WORKLOAD").as_deref().ok()) {
+        Ok(workload) => workload,
+        Err(reason) => {
+            eprintln!("dbt_bench: {reason}");
+            std::process::exit(2);
+        }
+    };
 
-    let pe_bytes = build_pe(&code);
+    let pe_bytes = build_pe(&workload.code);
     let parsed = ParsedPe::parse(&pe_bytes).unwrap();
     let mut loaded = parsed.load_into_memory(&pe_bytes).unwrap();
     loaded
@@ -828,16 +905,15 @@ fn main() {
         let start = Instant::now();
         let result = black_box(interp.run());
         let interpreter_time = start.elapsed();
-        check(result);
+        check(result, &workload);
 
         let mut dbt = DbtEngine::new(4 * 1024 * 1024).unwrap();
         let mut cpu = initial_cpu.clone();
         let start = Instant::now();
         let result = black_box(dbt.run(&mut cpu, &mut loaded.memory, BUDGET));
         let cold_time = start.elapsed();
-        check(result);
+        check(result, &workload);
         assert!(dbt.metrics.blocks_compiled > 0);
-        assert_eq!(dbt.metrics.cache_hits, 0);
         assert_eq!(dbt.metrics.cache_misses, dbt.metrics.blocks_compiled);
         let metrics = dbt.metrics;
 
@@ -845,10 +921,10 @@ fn main() {
         let start = Instant::now();
         let result = black_box(dbt.run(&mut cpu, &mut loaded.memory, BUDGET));
         let warm_time = start.elapsed();
-        check(result);
+        check(result, &workload);
         assert_eq!(dbt.metrics.blocks_compiled, metrics.blocks_compiled);
-        assert_eq!(dbt.metrics.cache_hits, dbt.metrics.blocks_compiled);
-        assert_eq!(dbt.metrics.cache_misses, dbt.metrics.blocks_compiled);
+        assert!(dbt.metrics.cache_hits > metrics.cache_hits);
+        assert_eq!(dbt.metrics.cache_misses, metrics.cache_misses);
 
         if record {
             interpreter.push(interpreter_time);
@@ -858,7 +934,10 @@ fn main() {
         }
     }
 
-    println!("{INSTRUCTIONS} guest instructions per sample, final RAX={ADDS}");
+    println!(
+        "{} workload: {} guest instructions per sample, final RAX={}",
+        workload.name, workload.instructions, workload.final_rax
+    );
     println!("{warmup_count} warmup rounds excluded (XENORA_DBT_BENCH_WARMUP, default 10)");
     println!(
         "Cold DBT includes translation with a fresh engine; warm DBT reuses that engine's cache."
@@ -867,9 +946,9 @@ fn main() {
         "Percentiles describe this synthetic workload on this host; tail estimates vary with sample count."
     );
     println!("Even sample counts use the midpoint of the two middle values for the median.");
-    let interpreter = summarize(&mut interpreter);
-    let cold = summarize(&mut cold);
-    let warm = summarize(&mut warm);
+    let interpreter = summarize(&mut interpreter, workload.instructions);
+    let cold = summarize(&mut cold, workload.instructions);
+    let warm = summarize(&mut warm, workload.instructions);
     println!("{}", report_line("Interpreter", &interpreter));
     println!("{}", report_line("Cold DBT", &cold));
     println!("{}", report_line("Warm DBT", &warm));
@@ -880,8 +959,8 @@ fn main() {
     );
 
     if let Some(path) = std::env::var_os("XENORA_DBT_BENCH_JSON") {
-        let info = run_info(code.len(), warmup_count);
-        let document = json_document(&info, &interpreter, &cold, &warm, &metrics);
+        let info = run_info(workload.code.len(), warmup_count);
+        let document = json_document(&info, &workload, &interpreter, &cold, &warm, &metrics);
         std::fs::write(&path, document + "\n").expect("write XENORA_DBT_BENCH_JSON");
         println!("JSON results written to {}", path.to_string_lossy());
     }
@@ -976,7 +1055,7 @@ mod tests {
             }
         }
 
-        use super::{DbtMetrics, INSTRUCTIONS, json_document};
+        use super::{DbtMetrics, add_chain, json_document};
 
         let metrics = DbtMetrics {
             blocks_compiled: 626,
@@ -989,8 +1068,10 @@ mod tests {
             interpreter_fallbacks: 1,
             service_calls: 0,
         };
+        let workload = add_chain();
         let document = json_document(
             &fixed_info(),
+            &workload,
             &fixed_summary(20),
             &fixed_summary(30),
             &fixed_summary(40),
@@ -1007,11 +1088,11 @@ mod tests {
                 r#""host":{{"cpu":"Test \"CPU\"\\1","os":"macos","os_version":null,"arch":"aarch64"}},"#,
                 r#""source":{{"revision":"0123abcd","dirty":false}},"#,
                 r#""build":{{"debug_assertions":false,"label":"fat-lto"}},"#,
-                r#""workload":{{"name":"add_rax_chain","guest_instructions":{},"guest_code_bytes":40011,"instruction_budget":20000,"warmup_rounds":10}},"#,
+                r#""workload":{{"name":"add-chain","guest_instructions":{},"guest_code_bytes":40011,"instruction_budget":20000,"warmup_rounds":10}},"#,
                 r#""timings":{{"interpreter":{},"cold_dbt":{},"warm_dbt":{}}},"#,
                 r#""cold_dbt_metrics":{{"blocks_compiled":626,"cache_hits":0,"cache_misses":626,"native_bytes_emitted":245168,"dbt_dispatches":626,"instructions_executed":10002,"interpreter_fallbacks":1,"service_calls":0}}}}"#,
             ),
-            INSTRUCTIONS,
+            workload.instructions,
             summary("20000"),
             summary("30000"),
             summary("40000"),
@@ -1045,10 +1126,10 @@ mod tests {
 
     #[test]
     fn summary_matches_the_percentile_helper() {
-        use super::{Duration, INSTRUCTIONS, summarize};
+        use super::{Duration, summarize};
 
         let mut samples = [100, 10, 30, 20].map(Duration::from_micros);
-        let s = summarize(&mut samples);
+        let s = summarize(&mut samples, 10_002);
         assert_eq!(s.samples, 4);
         assert_eq!(s.median, Duration::from_micros(25));
         assert_eq!(s.min, Duration::from_micros(10));
@@ -1056,7 +1137,7 @@ mod tests {
         assert_eq!(s.p95, Duration::from_nanos(89_500));
         assert_eq!(s.p99, Duration::from_nanos(97_900));
         assert_eq!(s.iqr, Duration::from_micros(30));
-        assert_eq!(s.mips, INSTRUCTIONS as f64 / 25e-6 / 1e6);
+        assert_eq!(s.mips, 10_002_f64 / 25e-6 / 1e6);
     }
 
     // `cargo bench` builds this target with `--cfg test` but without `--test`,
@@ -1193,8 +1274,9 @@ mod tests {
             native_bytes_emitted: 42,
             ..DbtMetrics::default()
         };
+        let workload = super::branch_loop();
         let doc = parse_json(&json_document(
-            &info, &summary, &summary, &summary, &metrics,
+            &info, &workload, &summary, &summary, &summary, &metrics,
         ))
         .unwrap();
         let string = |s: &str| Some(Json::String(s.to_owned()));
@@ -1355,5 +1437,52 @@ mod tests {
         fields.retain(|(k, _)| k != "workload");
         let error = compare_documents(&comparable_document(), &missing).unwrap_err();
         assert!(error.contains("missing field `workload.name`"), "{error}");
+    }
+
+    #[test]
+    fn workload_layouts_match_their_independent_instruction_counts() {
+        use super::{
+            ADDS, BRANCH_ITERATIONS, MEMORY_ITERATIONS, add_chain, branch_loop, checked_memory,
+        };
+
+        let add = add_chain();
+        assert_eq!(add.name, "add-chain");
+        assert_eq!(add.code.len(), 10 + ADDS * 4 + 1);
+        assert_eq!(add.instructions, ADDS + 2);
+        assert_eq!(add.final_rax, ADDS as u64);
+        assert_eq!(add.code[..2], [0x48, 0xB8]);
+        assert_eq!(add.code.last(), Some(&0xF4));
+
+        let branch = branch_loop();
+        assert_eq!(branch.name, "branch-loop");
+        assert_eq!(branch.code.len(), 10 + 4 + 2 + 1);
+        assert_eq!(branch.instructions, 1 + BRANCH_ITERATIONS * 2 + 1);
+        assert_eq!(branch.final_rax, 0);
+        assert_eq!(branch.code[10..14], [0x48, 0x83, 0xE8, 0x01]);
+        // The jump ends at byte 16 and byte 10 is six bytes earlier.
+        assert_eq!(branch.code[14..16], [0x75, 0xFA]);
+
+        let memory = checked_memory();
+        assert_eq!(memory.name, "checked-memory");
+        assert_eq!(memory.code.len(), 10 + 10 + MEMORY_ITERATIONS * 11 + 1);
+        assert_eq!(memory.instructions, 2 + MEMORY_ITERATIONS * 4 + 1);
+        assert_eq!(memory.final_rax, MEMORY_ITERATIONS as u64);
+        assert_eq!(memory.code[10..12], [0x48, 0xB9]);
+        assert!(MEMORY_ITERATIONS * 4 <= 0x4000);
+    }
+
+    #[test]
+    fn workload_selection_is_exact_and_reports_unknown_names() {
+        use super::workload;
+
+        assert_eq!(workload(None).unwrap().name, "add-chain");
+        assert_eq!(workload(Some("branch-loop")).unwrap().name, "branch-loop");
+        assert_eq!(
+            workload(Some("checked-memory")).unwrap().name,
+            "checked-memory"
+        );
+        let error = workload(Some("branches")).unwrap_err();
+        assert!(error.contains("unknown workload"), "{error}");
+        assert!(error.contains("branch-loop"), "{error}");
     }
 }

@@ -22,13 +22,18 @@
 //! guide's loops over bits from integer division), the binary32 rounding
 //! forms TRUNC, CEIL, RNDNE and FLOOR (host binary64 rounding of the exactly
 //! widened input; NaN inputs and integer inline constants are refused) and SWAP_B32 (VGPR SRC0),
-//! VOP2 bitwise, shift, arithmetic-shift and float, the VOP2 integer forms
+//! VOP2 bitwise, shift and arithmetic-shift, the VOP2 binary32 forms
+//! ADD/SUB/SUBREV/MUL/MIN/MAX_F32 (host binary32 arithmetic; subnormal and
+//! NaN inputs, signalling NaNs to MIN/MAX, NaN results and results below
+//! 2^-126 are refused; integer inline constants are refused), the VOP2 integer forms
 //! MUL_I32_I24, MUL_HI_I32_I24, MUL_U32_U24, MUL_HI_U32_U24, MIN/MAX (I32,
 //! U32), XNOR and ADD/SUB/SUBREV_NC_U32 (any SRC0 a VOPC compare takes; a
 //! shift-and-add multiplier and floor division for the high half, the ripple
 //! adder for add and subtract), VOP3A integer arithmetic and compares, MUBUF
-//! load/store and the two waits plus `s_endpgm`. Anything else is a controlled
-//! error. The arithmetic shift is evaluated as a floor division by a power of
+//! load/store, SMEM `s_buffer_load_dword`/`_x2`/`_x4` with
+//! `s_waitcnt lgkmcnt(0)`, MIMG 2D `image_sample_lz`/`image_sample_l`, and the
+//! two vector waits plus `s_endpgm`. Anything else is a controlled error. The
+//! arithmetic shift is evaluated as a floor division by a power of
 //! two rather than with a host signed shift, so the oracle does not share the
 //! production operator. SOP2 arithmetic runs through a bit-serial ripple
 //! adder (subtraction as addition of the complement), not host integer ops.
@@ -111,19 +116,37 @@ enum Insn {
     VShiftRight(u8, u8, u8),
     VShiftRightArithmetic(u8, u8, u8),
     VXor(u8, u8, u8),
-    /// VOP2 integer opcode 9-12, 17-20, 30 or 37-39: VDST, SRC0, VSRC1.
+    /// VOP2 integer opcode 9-12, 17-20, 30 or 37-39, or binary32 opcode 3-5,
+    /// 8, 15 or 16: VDST, SRC0, VSRC1.
     VInt(u32, u8, CmpSrc, u8),
     VIntVcc(u32, u8, CmpSrc, u8),
     /// VOP1 integer opcode 55-59 or binary32 rounding opcode 33-36: VDST, SRC0.
     VUnary(u32, u8, CmpSrc),
     /// `v_swap_b32 vD, vS` (VOP1 opcode 101).
     VSwap(u8, u8),
-    VAddF(u8, u8, u8),
-    VMulF(u8, u8, u8),
     Load(u8),
     Store(u8),
     WaitRead,
     WaitWrite,
+    /// SMEM `s_buffer_load_dword`, `_x2` or `_x4` from the synthetic input
+    /// buffer (`s[0:3]`, base zero) into `dwords` consecutive SGPRs.
+    SLoad {
+        dst: u8,
+        dwords: u8,
+        offset: u32,
+    },
+    /// `s_waitcnt lgkmcnt(0)`. The synthetic scalar load completes immediately.
+    WaitScalar,
+    /// MIMG 2D image sample into `dst..` with one VGPR per DMASK component;
+    /// the LOD is level zero or read from `coord + 2` (`explicit_lod`).
+    ImageSample {
+        dst: u8,
+        coord: u8,
+        resource: u8,
+        sampler: u8,
+        dmask: u8,
+        explicit_lod: bool,
+    },
     End,
 }
 
@@ -138,7 +161,7 @@ pub fn execute(code: &[u8], input: &[u32]) -> Result<Vec<u32>, String> {
     let program = decode(code)?;
     let mut output = Vec::with_capacity(input.len());
     for wave in input.chunks(32) {
-        output.extend(run_wave(&program, wave)?);
+        output.extend(run_wave(&program, wave, input)?);
     }
     Ok(output)
 }
@@ -168,7 +191,7 @@ fn wave_error(lanes: &mut [Lane], error: String) -> String {
     first_error(lanes).unwrap_or(error)
 }
 
-fn run_wave(program: &[(usize, Insn)], wave: &[u32]) -> Result<Vec<u32>, String> {
+fn run_wave(program: &[(usize, Insn)], wave: &[u32], buffer: &[u32]) -> Result<Vec<u32>, String> {
     let mut lanes: Vec<Lane> = wave
         .iter()
         .map(|&input| Lane {
@@ -306,6 +329,27 @@ fn run_wave(program: &[(usize, Insn)], wave: &[u32]) -> Result<Vec<u32>, String>
                     })
                 }
             }
+            Insn::SLoad {
+                dst,
+                dwords,
+                offset,
+            } => {
+                if dst < 8 {
+                    return Err(wave_error(
+                        &mut lanes,
+                        format!("{offset:#x}: scalar load into a resource descriptor"),
+                    ));
+                }
+                for index in 0..usize::from(dwords) {
+                    let word = offset as usize / 4 + index;
+                    let value = buffer.get(word).copied().ok_or_else(|| {
+                        format!("{offset:#x}: scalar load outside the input buffer")
+                    })?;
+                    sgpr[usize::from(dst) + index] = Some(value);
+                }
+                Ok(None)
+            }
+            Insn::WaitScalar => Ok(None),
             Insn::SMov(dst, src) => {
                 if dst < 8 {
                     Err(format!("{offset:#x}: write to a resource SGPR"))
@@ -369,6 +413,27 @@ fn run_wave(program: &[(usize, Insn)], wave: &[u32]) -> Result<Vec<u32>, String>
                 }
             }
             Insn::Branch(target) => index_of(program, target, offset).map(Some),
+            Insn::ImageSample {
+                dst,
+                coord,
+                resource,
+                sampler,
+                dmask,
+                explicit_lod,
+            } => {
+                if let Some(error) = first_error(&lanes) {
+                    return Err(error);
+                }
+                image_sample(
+                    &mut lanes,
+                    &sgpr,
+                    execution_mask,
+                    buffer,
+                    (dst, coord, resource, sampler, dmask, explicit_lod),
+                    offset,
+                )
+                .map(|()| None)
+            }
             _ => {
                 for (lane_index, lane) in lanes.iter_mut().enumerate() {
                     if lane.error.is_none()
@@ -388,6 +453,155 @@ fn run_wave(program: &[(usize, Insn)], wave: &[u32]) -> Result<Vec<u32>, String>
         }
     }
     Err(first_error(&lanes).unwrap_or_else(|| "stream ended without s_endpgm".to_string()))
+}
+
+/// The consecutive SGPRs of a validated image descriptor.
+fn resource_words(
+    sgpr: &[Option<u32>; 128],
+    base: u8,
+    count: usize,
+    offset: usize,
+) -> Result<Vec<u32>, String> {
+    (0..count)
+        .map(|index| {
+            sgpr[usize::from(base) + index]
+                .ok_or_else(|| format!("{offset:#x}: uninitialized descriptor SGPR"))
+        })
+        .collect()
+}
+
+/// Independent nearest-neighbor, clamp-to-edge RGBA8 sample: the coordinate is
+/// clamped to [0,1], scaled by the mip dimensions and truncated toward zero to
+/// the texel index (the host reference floors a binary64 product instead, so the
+/// two oracles do not share the coordinate arithmetic).
+fn sample_texel(
+    wave: &[u32],
+    base: usize,
+    width: usize,
+    height: usize,
+    mip: u32,
+    u_bits: u32,
+    v_bits: u32,
+) -> Result<[u8; 4], String> {
+    let u = f32::from_bits(u_bits).clamp(0.0, 1.0);
+    let v = f32::from_bits(v_bits).clamp(0.0, 1.0);
+    let w = width >> mip;
+    let h = height >> mip;
+    let x = ((u * w as f32) as usize).min(w - 1);
+    let y = ((v * h as f32) as usize).min(h - 1);
+    let mut offset = base / 4;
+    for level in 0..mip {
+        offset += (width >> level) * (height >> level);
+    }
+    let word = wave
+        .get(offset + y * w + x)
+        .ok_or_else(|| "texture data outside the input buffer".to_string())?;
+    Ok(word.to_le_bytes())
+}
+
+/// Execute one MIMG image sample for the whole wave, writing one VGPR per
+/// DMASK-selected component of each active lane. Descriptor validation follows
+/// guide Tables 45 and 46 directly from the SGPR words.
+#[allow(clippy::too_many_arguments)]
+fn image_sample(
+    lanes: &mut [Lane],
+    sgpr: &[Option<u32>; 128],
+    exec: u32,
+    buffer: &[u32],
+    (dst, coord, resource, sampler, dmask, explicit_lod): (u8, u8, u8, u8, u8, bool),
+    offset: usize,
+) -> Result<(), String> {
+    let r = resource_words(sgpr, resource, 8, offset)?;
+    if r[4..].iter().any(|&word| word != 0) {
+        return Err(format!(
+            "{offset:#x}: nonzero 256-bit resource extension words"
+        ));
+    }
+    let ty = (r[3] >> 28) & 0xf;
+    let format = (r[1] >> 20) & 0x1ff;
+    let width1 = (r[1] >> 30) | ((r[2] & 0x3fff) << 2);
+    let height1 = (r[2] >> 14) & 0xffff;
+    if width1 & 0xc000 != 0 || height1 & 0xc000 != 0 {
+        return Err(format!(
+            "{offset:#x}: resource width or height sets a reserved high bit"
+        ));
+    }
+    let width = width1 as usize + 1;
+    let height = height1 as usize + 1;
+    if ty != 9 {
+        return Err(format!(
+            "{offset:#x}: resource descriptor is not a 2D image"
+        ));
+    }
+    if format != 56 {
+        return Err(format!(
+            "{offset:#x}: resource descriptor is not RGBA8 unorm"
+        ));
+    }
+    if (r[3] >> 20) & 0x1f != 0 {
+        return Err(format!("{offset:#x}: resource swizzle mode is not linear"));
+    }
+    if (r[1] >> 8) & 0xfff != 0 {
+        return Err(format!("{offset:#x}: resource minimum LOD is nonzero"));
+    }
+    let base_level = (r[3] >> 12) & 0xf;
+    let last_level = (r[3] >> 16) & 0xf;
+    if last_level < base_level {
+        return Err(format!(
+            "{offset:#x}: resource last level is below base level"
+        ));
+    }
+    // Resource level 1, an identity RGBA channel select and base level 0.
+    if (r[2] >> 31) & 1 != 1 || (r[3] & 0xfff) != 0xfac || base_level != 0 {
+        return Err(format!(
+            "{offset:#x}: unsupported resource level or channel select"
+        ));
+    }
+    let s = resource_words(sgpr, sampler, 4, offset)?;
+    let clamp = (s[0] & 0x3f) == 0x12 && (s[0] >> 6) & 0x7 == 2;
+    let point = ((s[2] >> 20) & 0xf) == 0 && (s[2] >> 24) & 0x3 == 0;
+    let mip_filter = (s[2] >> 26) & 0x3 == 1;
+    let bias = (s[2] & 0xfff) == 0 && (s[2] >> 12) & 0x3 == 0;
+    let min_lod = s[1] & 0xfff;
+    let max_lod = (s[1] >> 12) & 0xfff;
+    if !clamp || !point || !mip_filter || !bias || min_lod != 0 || max_lod < last_level << 8 {
+        return Err(format!(
+            "{offset:#x}: sampler is not point filtering with clamp addressing and an explicit mip level"
+        ));
+    }
+    let base = ((r[0] as u64) | (u64::from(r[1] & 0xff) << 32)) << 8;
+    let base = base as usize;
+    let mips = last_level - base_level + 1;
+    for (lane_index, lane) in lanes.iter_mut().enumerate() {
+        if exec & (1 << lane_index) == 0 {
+            continue;
+        }
+        let u = read_vgpr(lane, coord, offset)?;
+        let v = read_vgpr(lane, coord + 1, offset)?;
+        let mip = if explicit_lod {
+            let lod = f32::from_bits(read_vgpr(lane, coord + 2, offset)?);
+            if !lod.is_finite() || lod < 0.0 || lod.fract() != 0.0 || lod as u32 >= mips {
+                return Err(format!(
+                    "{offset:#x}: explicit LOD is not a representable integer mip level"
+                ));
+            }
+            lod as u32
+        } else {
+            0
+        };
+        let texel = sample_texel(buffer, base, width, height, mip, u, v)?;
+        let mut slot = dst;
+        for component in 0..4u8 {
+            if dmask & (1 << component) == 0 {
+                continue;
+            }
+            check_destination(slot, lane.pending_read, offset)?;
+            lane.vgpr[usize::from(slot)] =
+                Some((f32::from(texel[usize::from(component)]) / 255.0).to_bits());
+            slot += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Guide 12.7 vector select and carry/borrow, with the Wave32 mask from 3.9.
@@ -951,9 +1165,7 @@ fn lane_step(
             | Insn::VShiftRightArithmetic(dst, ..)
             | Insn::VInt(_, dst, ..)
             | Insn::VUnary(_, dst, _)
-            | Insn::VSwap(dst, _)
-            | Insn::VAddF(dst, ..)
-            | Insn::VMulF(dst, ..) => {
+            | Insn::VSwap(dst, _) => {
                 if execution_mask != 0 && lane.vgpr[usize::from(dst)].is_none() {
                     return Err(format!("{offset:#x}: partial EXEC on uninitialized VGPR"));
                 }
@@ -1100,7 +1312,13 @@ fn lane_step(
                 CmpSrc::Imm(value) => value,
                 CmpSrc::Vgpr(reg) => read_v(reg)?,
             };
-            (dst, vector_integer(opcode, a, read_v(src1)?))
+            let b = read_v(src1)?;
+            let d = if matches!(opcode, 3..=5 | 8 | 15 | 16) {
+                vector_float(opcode, a, b, offset)?
+            } else {
+                vector_integer(opcode, a, b)
+            };
+            (dst, d)
         }
         Insn::VUnary(opcode, dst, src0) => {
             check_destination(dst, pending_read, offset)?;
@@ -1125,14 +1343,6 @@ fn lane_step(
             lane.vgpr[dst as usize] = Some(old_src0);
             lane.vgpr[src0 as usize] = Some(old_dst);
             return Ok(());
-        }
-        Insn::VAddF(dst, a, b) => {
-            check_destination(dst, pending_read, offset)?;
-            (dst, exact_float(true, read_v(a)?, read_v(b)?, offset)?)
-        }
-        Insn::VMulF(dst, a, b) => {
-            check_destination(dst, pending_read, offset)?;
-            (dst, exact_float(false, read_v(a)?, read_v(b)?, offset)?)
         }
         _ => unreachable!("scalar instruction in lane_step"),
     };
@@ -1274,42 +1484,64 @@ fn index_of(program: &[(usize, Insn)], target: usize, offset: usize) -> Result<u
         .ok_or_else(|| format!("{offset:#x}: branch target {target:#x} is not a boundary"))
 }
 
-fn exact_float(add: bool, a_bits: u32, b_bits: u32, offset: usize) -> Result<u32, String> {
-    fn unpack(bits: u32) -> Option<(u64, i32)> {
-        let biased = ((bits >> 23) & 0xff) as i32;
-        if bits >> 31 != 0 || !(1..=254).contains(&biased) {
-            return None;
-        }
-        let significand = (1 << 23) | (bits & 0x007f_ffff);
-        Some((u64::from(significand), biased - 127 - 23))
-    }
-
-    let operand_error = || format!("{offset:#x}: float outside positive normal domain");
-    let (a, scale_a) = unpack(a_bits).ok_or_else(operand_error)?;
-    let (b, scale_b) = unpack(b_bits).ok_or_else(operand_error)?;
-    let result_error = || format!("{offset:#x}: float result not exact normal binary32");
-    let (integer, scale) = if add {
-        let scale = scale_a.min(scale_b);
-        // A nonzero operand at least 24 exponents lower is strictly
-        // less than one ULP of the larger operand and cannot sum exactly.
-        if scale_a.abs_diff(scale_b) >= 24 {
-            return Err(result_error());
-        }
-        ((a << (scale_a - scale)) + (b << (scale_b - scale)), scale)
-    } else {
-        // Two 24-bit significands multiply exactly in an unsigned 64-bit word.
-        (a * b, scale_a + scale_b)
+/// D of VOP2 binary32 opcode 3, 4, 5, 8, 15 or 16 (guide 12.7: ADD, SUB,
+/// SUBREV and MUL on page 131, MIN on page 132, MAX on page 133) for S0 =
+/// `a_bits`, S1 = `b_bits`, from host binary32 arithmetic and comparisons.
+///
+/// Refused: subnormal inputs (Metal flushes them; MODE.FP_DENORM is pinned
+/// only for inputs), NaN inputs to the arithmetic forms, signalling NaN inputs
+/// to MIN and MAX (IEEE_MODE and Quiet() are not pinned), and arithmetic
+/// results that are NaN or whose exact value is nonzero and below 2^-126.
+/// Binary64 holds the exact product, and the exact sum whenever it is that
+/// small, so the size check is made on the binary64 result.
+fn vector_float(opcode: u32, a_bits: u32, b_bits: u32, offset: usize) -> Result<u32, String> {
+    let refuse = |what: &str| {
+        Err(format!(
+            "{offset:#x}: binary32 {what} is outside the domain"
+        ))
     };
-
-    let leading = integer.ilog2();
-    let trailing = integer.trailing_zeros();
-    let exponent = scale + leading as i32;
-    let significant_width = leading - trailing + 1;
-    if significant_width > 24 || !(-126..=127).contains(&exponent) {
-        return Err(result_error());
+    let (a, b) = (f32::from_bits(a_bits), f32::from_bits(b_bits));
+    if a.is_subnormal() || b.is_subnormal() {
+        return refuse("subnormal input");
     }
-    let normalized = ((integer >> trailing) << (24 - significant_width)) as u32;
-    Ok((((exponent + 127) as u32) << 23) | (normalized & 0x007f_ffff))
+    if opcode == 15 || opcode == 16 {
+        let signalling = |x: f32, bits: u32| x.is_nan() && bits & 0x0040_0000 == 0;
+        if signalling(a, a_bits) || signalling(b, b_bits) {
+            return refuse("signalling NaN input");
+        }
+        // The pseudocode's order of cases.
+        return Ok(if a.is_nan() {
+            b_bits
+        } else if b.is_nan() {
+            a_bits
+        } else if a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative() {
+            if opcode == 15 {
+                (-0.0f32).to_bits()
+            } else {
+                0.0f32.to_bits()
+            }
+        } else if (opcode == 15 && a < b) || (opcode == 16 && a >= b) {
+            a_bits
+        } else {
+            b_bits
+        });
+    }
+    if a.is_nan() || b.is_nan() {
+        return refuse("NaN input");
+    }
+    let (wide, d) = match opcode {
+        3 => (f64::from(a) + f64::from(b), a + b),
+        4 => (f64::from(a) - f64::from(b), a - b),
+        5 => (f64::from(b) - f64::from(a), b - a),
+        _ => (f64::from(a) * f64::from(b), a * b),
+    };
+    if d.is_nan() {
+        return refuse("NaN result");
+    }
+    if wide != 0.0 && wide.abs() < f64::from(f32::MIN_POSITIVE) {
+        return refuse("result below 2^-126");
+    }
+    Ok(d.to_bits())
 }
 
 fn decode(code: &[u8]) -> Result<Vec<(usize, Insn)>, String> {
@@ -1446,7 +1678,14 @@ fn decode_one(code: &[u8], offset: usize) -> Result<(Insn, usize), String> {
             len,
         ));
     }
-    if first >> 31 == 0 && matches!(vop2_op, 9..=12 | 17..=20 | 30 | 37..=39) {
+    // Binary32 forms: integer inline constants (128-208) are refused.
+    if first >> 31 == 0
+        && matches!(vop2_op, 3..=5 | 8 | 15 | 16)
+        && (128..=208).contains(&(first & 0x1ff))
+    {
+        return Err(fail("integer inline constant as a binary32 source"));
+    }
+    if first >> 31 == 0 && matches!(vop2_op, 3..=5 | 8..=12 | 15..=20 | 30 | 37..=39) {
         let (src0, len) = vector_src0(code, offset, first, "VOP2")?;
         let insn = Insn::VInt(vop2_op, (first >> 17) as u8, src0, (first >> 9) as u8);
         return Ok((insn, len));
@@ -1591,8 +1830,6 @@ fn decode_one(code: &[u8], offset: usize) -> Result<(Insn, usize), String> {
     for (mask, value, kind) in [
         (0xfe00_0000, 0x3600_0000u32, 0u8),
         (0xfe00_0000, 0x3a00_0000, 1),
-        (0xfe00_0000, 0x0600_0000, 2),
-        (0xfe00_0000, 0x1000_0000, 3),
         (0xfe00_0000, 0x3800_0000, 4),
         (0xfe00_0000, 26 << 25, 5),
         (0xfe00_0000, 22 << 25, 6),
@@ -1608,8 +1845,6 @@ fn decode_one(code: &[u8], offset: usize) -> Result<(Insn, usize), String> {
             let insn = match kind {
                 0 => Insn::VAnd(dst, a, b),
                 1 => Insn::VXor(dst, a, b),
-                2 => Insn::VAddF(dst, a, b),
-                3 => Insn::VMulF(dst, a, b),
                 4 => Insn::VOr(dst, a, b),
                 5 => Insn::VShiftLeft(dst, a, b),
                 6 => Insn::VShiftRight(dst, a, b),
@@ -1619,10 +1854,11 @@ fn decode_one(code: &[u8], offset: usize) -> Result<(Insn, usize), String> {
         }
     }
     if first & 0xffff_0000 == 0xbf8c_0000 {
-        if first != 0xbf8c_3f70 {
-            return Err(fail("waitcnt not vmcnt(0)"));
-        }
-        return Ok((Insn::WaitRead, 4));
+        return match first {
+            0xbf8c_3f70 => Ok((Insn::WaitRead, 4)),
+            0xbf8c_c07f => Ok((Insn::WaitScalar, 4)),
+            _ => Err(fail("waitcnt not vmcnt(0) or lgkmcnt(0)")),
+        };
     }
     if first & 0xff80_0000 == 0xbb80_0000 {
         if first != 0xbbfd_0000 {
@@ -1635,6 +1871,82 @@ fn decode_one(code: &[u8], offset: usize) -> Result<(Insn, usize), String> {
             return Err(fail("endpgm immediate"));
         }
         return Ok((Insn::End, 4));
+    }
+    // SMEM s_buffer_load_dword/_x2/_x4 (guide 13.2.1, Tables 73 and 74). The
+    // synthetic ABI uses the input buffer as s[0:3] with no additional offset.
+    if first & 0xff00_0000 == 0xf400_0000 {
+        let opcode = (first >> 16) & 0xff;
+        let dwords = match opcode {
+            0x20 => 1u8,
+            0x24 => 2,
+            0x28 => 4,
+            _ => return Err(fail("unsupported scalar load width")),
+        };
+        let low = first & 0xff;
+        let middle = (first >> 8) & 0x1f;
+        let data = ((middle << 2) | (low >> 6)) as u8;
+        let resource = ((low & 0x3f) * 2) as u8;
+        let second = word(code, offset + 4)?;
+        let byte_offset = second & 0x00ff_ffff;
+        let selector = (second >> 24) as u8;
+        if resource != 0 || selector >> 1 != 125 {
+            return Err(fail("scalar load outside the synthetic ABI"));
+        }
+        if u16::from(data) + u16::from(dwords) > 106 {
+            return Err(fail("scalar load register span"));
+        }
+        return Ok((
+            Insn::SLoad {
+                dst: data,
+                dwords,
+                offset: byte_offset,
+            },
+            8,
+        ));
+    }
+    // MIMG (guide 8.2 and 13.9 Table 100, printed page 277): byte 3 (bits
+    // 24-31) carries the ENCODING 0b111100 with the opcode's high bit and SLC
+    // clear. Only the two explicit-LOD sample forms are accepted.
+    if first >> 24 == 0xf0 {
+        let opcode = ((first & 1) << 7) | ((first >> 18) & 0x7f);
+        let explicit_lod = match opcode {
+            36 => true,
+            39 => false,
+            _ => return Err(fail("unsupported MIMG opcode")),
+        };
+        // Non-NSA, DIM 2D, DLC/UNORM/GLC/DA/R128/TFE/LWE and the reserved bit
+        // clear, DMASK nonzero.
+        if first & 0x0203_f0fe != 0x8 || (first >> 8) & 0xf == 0 {
+            return Err(fail("unsupported MIMG encoding or data mask"));
+        }
+        let second = word(code, offset + 4).map_err(|_| fail("truncated MIMG"))?;
+        if second & 0xfc00_0000 != 0 {
+            return Err(fail("unsupported MIMG A16/D16"));
+        }
+        let dmask = ((first >> 8) & 0xf) as u8;
+        let coord = (second & 0xff) as u8;
+        let dst = ((second >> 8) & 0xff) as u8;
+        let resource = (((second >> 16) & 0x1f) * 4) as u8;
+        let sampler = (((second >> 21) & 0x1f) * 4) as u8;
+        if resource > 98 || sampler > 102 {
+            return Err(fail("unsupported MIMG descriptor registers"));
+        }
+        let components = u16::from(dmask.count_ones() as u8);
+        let address = if explicit_lod { 3 } else { 2 };
+        if u16::from(dst) + components - 1 > 255 || u16::from(coord) + address - 1 > 255 {
+            return Err(fail("unsupported MIMG register span"));
+        }
+        return Ok((
+            Insn::ImageSample {
+                dst,
+                coord,
+                resource,
+                sampler,
+                dmask,
+                explicit_lod,
+            },
+            8,
+        ));
     }
     Err(fail("unsupported opcode"))
 }

@@ -120,6 +120,11 @@ pub enum Operation {
     RoundNearestEven,
     /// Binary32 rounding down to an integral value (guide 12.8).
     Floor,
+    /// MIMG `image_sample_lz`: sample a 2D texture at level of detail zero.
+    ImageSampleLz,
+    /// MIMG `image_sample_l`: sample a 2D texture at an explicit level of
+    /// detail read from the address tuple.
+    ImageSampleL,
 }
 
 /// Per-lane operation with one input and one result: integer and bit forms,
@@ -185,6 +190,28 @@ pub enum VectorBinary {
     ShiftRight,
     /// Arithmetic (sign-filling) `a >> (b & 31)`.
     ArithmeticShiftRight,
+    /// Binary32 `a + b`, round to nearest even (guide 12.7).
+    AddF32,
+    /// Binary32 `a - b`, round to nearest even (guide 12.7).
+    SubF32,
+    /// Binary32 `a * b`, round to nearest even (guide 12.7).
+    MulF32,
+    /// Binary32 minimum by the guide 12.7 V_MIN_F32 rule: a quiet NaN gives
+    /// the other operand and a signed-zero pair gives -0.
+    MinF32,
+    /// Binary32 maximum by the guide 12.7 V_MAX_F32 rule: a quiet NaN gives
+    /// the other operand and a signed-zero pair gives +0.
+    MaxF32,
+}
+
+impl VectorBinary {
+    /// The binary32 operations, which read float operands.
+    pub fn is_float(self) -> bool {
+        matches!(
+            self,
+            Self::AddF32 | Self::SubF32 | Self::MulF32 | Self::MinF32 | Self::MaxF32
+        )
+    }
 }
 
 /// How the operands are interpreted. `Bitwise` exactly when the operation is logical.
@@ -339,8 +366,16 @@ pub enum OperandRule {
     Vop1Vgpr,
     /// VOP1 binary32 rounding: as `Vop1Vgpr` without integer inline constants.
     Vop1F32,
+    /// VOP2 binary32 arithmetic: as `Vop2Vgpr` without integer inline constants.
+    Vop2F32,
     /// VOP1 swap: VDST and SRC0 each read and write a VGPR.
     Vop1Swap,
+    /// MIMG 2D sample (IMAGE_SAMPLE_LZ and IMAGE_SAMPLE_L): VDATA is the first
+    /// destination VGPR, VADDR the first address VGPR, SRSRC the base of an
+    /// eight-aligned SGPR resource descriptor and SSAMP the base of a
+    /// four-aligned SGPR sampler descriptor. Non-NSA, DIM 2D, R128 clear,
+    /// DMASK 1-15; everything else is rejected as unsupported.
+    Mimg2D,
 }
 
 /// Evidence a form needs before it counts as verified.

@@ -30,6 +30,8 @@ mod texture_sampling;
 mod translated_bc1;
 #[path = "native/translated_render.rs"]
 mod translated_render;
+#[path = "native/translated_sample.rs"]
+mod translated_sample;
 
 const KERNEL_HEADER: &str = r"
 #include <metal_stdlib>

@@ -357,6 +357,27 @@ count as a control. `crates/cli/tests/run_program.rs` runs all three through
 `xenora run`, and feeds one 1 MiB + 1 byte to check the refusal. Provenance
 is as for Gate A2.
 
+## Formatted input
+
+`tests/compat_fixtures/crt_scanf.c` (#605) is a hosted C program that reads
+formatted input with `sscanf`, `sscanf_s`, `scanf`, `scanf_s`, `fscanf` and
+`fscanf_s`. Built by `build-crt-scanf.sh` with mingw-w64 (UCRT flavour) and
+`-fno-builtin`, the six functions are mingw-w64 wrappers that call the
+imports `__stdio_common_vsscanf` and `__stdio_common_vfscanf` of
+`api-ms-win-crt-stdio-l1-1-0.dll`. The checks cover integers in each base and
+size, widths, strings, characters, scansets, decimal and hexadecimal floating
+point, `%%`, `%n`, suppression, matching and input failures, and the buffer
+sizes of the secure forms. The host pipes a fixed input in CR LF, which the
+program reads with `scanf` and `getchar`; it then writes a file in text mode
+and reads it back with `fscanf` in text and binary mode, checking each
+position with `_ftelli64`. Every expected value follows from the input and
+from ISO C 7.21.6.2 or Microsoft's pages; it exits with the number of the
+first failed check, or 0. It is built at `-O0` and `-O2`, and once at `-O1`
+with `CRT_SCANF_BREAK`, which expects the carriage return of a CR LF pair to
+survive, so check 17 fails, as a control. `crates/cli/tests/run_program.rs`
+runs all three through `xenora run`. Provenance is as for Gate A2. Nothing
+here has been compared with Windows.
+
 ## C runtime file positions
 
 `tests/compat_fixtures/crt_files.c` (#493) is a hosted C program that writes

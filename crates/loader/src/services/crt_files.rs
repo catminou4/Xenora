@@ -469,6 +469,31 @@ impl FileStreams {
     /// position (1) or the end of the file (2). A position before the start
     /// is `EINVAL`; one past the end is allowed, and a write there fills the
     /// gap with zeros. A stream whose file was deleted fails with `EBADF`.
+    /// The raw file bytes and cursor for a formatted byte read.
+    pub(super) fn reading<'d>(
+        &mut self,
+        drive: &'d ObjectState,
+        file: u64,
+    ) -> Result<(&'d [u8], usize, bool), u32> {
+        let stream = self.open.get_mut(&file).ok_or(EBADF)?;
+        if !stream.readable || !orient(stream, false) {
+            return Err(EBADF);
+        }
+        let data = drive.drive_file(&stream.path).ok_or(EBADF)?;
+        let at = usize::try_from(stream.position).map_or(data.len(), |at| at.min(data.len()));
+        Ok((data, at, stream.text))
+    }
+
+    /// After a formatted read: the cursor follows the input consumed and
+    /// the end-of-file indicator joins the scan's own report, even when
+    /// the scanner could not consume any input.
+    pub(super) fn finish_scan(&mut self, file: u64, consumed: usize, met_end: bool) {
+        if let Some(stream) = self.open.get_mut(&file) {
+            stream.position += consumed as u64;
+            stream.eof |= met_end;
+        }
+    }
+
     pub(super) fn seek(
         &mut self,
         drive: &ObjectState,

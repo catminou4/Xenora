@@ -22,10 +22,10 @@ name = "sampler_texture"
 path = "tests/sampler_texture.rs"
 
 [dev-dependencies]
-xenora-ref = { path = "../ref" }
 xenora-shader = { path = "../shader" }
 
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+xenora-ref = { path = "../ref" }
 xenora-texture = { path = "../texture" }
 objc2 = "=0.6.5"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSError", "NSString"] }

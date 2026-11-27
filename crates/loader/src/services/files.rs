@@ -377,11 +377,25 @@ fn find_first(
 
 /// The display form of a normalized drive name, `c:\name`, or nothing for
 /// an empty or invalid name.
-fn full_name(name: &str) -> Option<String> {
-    if name.is_empty() || !name.split('\\').all(valid_component) {
+/// Resolve a guest path against the process working directory, lexically,
+/// dot segments included: a drive letter or a leading backslash anchors at
+/// the volume root, anything else hangs under the working directory. The
+/// working directory itself starts at the root, which keeps the resolution
+/// of a fresh process the historical one. The CRT `_chdir` moves it, so the
+/// kernel file operations and the CRT forms stay consistent, the behaviour
+/// a single Windows process exposes.
+fn full_name(cwd: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
         return None;
     }
-    Some(format!("c:\\{name}"))
+    let resolved = super::crt::resolve_directory(cwd, name);
+    if !resolved
+        .split('\\')
+        .all(|part| part.is_empty() || valid_component(part))
+    {
+        return None;
+    }
+    Some(format!("c:\\{resolved}"))
 }
 
 /// The CRT `_finddata64i32_t` layout of mingw-w64: attributes at 0, the
@@ -1256,7 +1270,12 @@ pub(super) fn register(registry: &mut ImportRegistry, state: &Arc<ServicesState>
             let Some(name) = reader(memory, args.rcx).map_err(ExitReason::MemoryFault)? else {
                 return full.fail(cpu.gs_base, INVALID_NAME, 0);
             };
-            let Some(full_path) = full_name(&name) else {
+            let cwd = full
+                .crt_directory
+                .lock()
+                .expect("CRT working directory")
+                .clone();
+            let Some(full_path) = full_name(&cwd, &name) else {
                 return full.fail(cpu.gs_base, INVALID_NAME, 0);
             };
             // args: rcx input, rdx buffer size in characters, r8 buffer, r9 file-part output.
@@ -1660,7 +1679,8 @@ pub(super) fn register(registry: &mut ImportRegistry, state: &Arc<ServicesState>
     // small - or a result longer than the 260 characters a null buffer gets -
     // sets ERANGE. The display form is lowercase because the drive's names
     // are case-folded.
-    registry.register(UCRT, "_fullpath", |args, cpu, memory| {
+    let fullpath_state = Arc::clone(state);
+    registry.register(UCRT, "_fullpath", move |args, cpu, memory| {
         let fail = |memory: &mut GuestMemory, error: u32| -> Result<u64, ExitReason> {
             super::crt::set_errno(memory, cpu.gs_base, error)?;
             Ok(0)
@@ -1669,9 +1689,17 @@ pub(super) fn register(registry: &mut ImportRegistry, state: &Arc<ServicesState>
         else {
             return fail(memory, super::crt_files::EINVAL);
         };
-        let Some(full_path) = full_name(&name) else {
+        let cwd = fullpath_state
+            .crt_directory
+            .lock()
+            .expect("CRT working directory")
+            .clone();
+        let Some(resolved) = full_name(&cwd, &name) else {
             return fail(memory, super::crt_files::EINVAL);
         };
+        // `full_name` already answers the machine's display form - the
+        // lowercase drive letter the case-folded drive uses everywhere.
+        let full_path = resolved;
         let bytes = full_path.as_bytes();
         let needed = bytes.len() + 1;
         let buffer = if args.rcx == 0 {

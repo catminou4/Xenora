@@ -440,12 +440,226 @@ mod review {
         assert_eq!(independent.as_deref().ok(), expected, "{independent:?}");
     }
 
+    /// The encoding is valid, so the compiler accepts it, but the value is
+    /// outside the modelled domain, so both interpreters refuse it at run
+    /// time. The compiler cannot see the operands when they are in VGPRs.
+    fn verify_refused_at_run_time(code: &[u8], input: &[u32]) {
+        assert!(
+            compile(Architecture::Gfx1030, code).is_ok(),
+            "the compiler must accept the encoding"
+        );
+        let reference = xenora_ref::execute(code, input).unwrap_err();
+        assert_eq!(reference.offset, 16, "{reference:?}");
+        assert_eq!(
+            reference.detail, "binary32 operand or result outside domain",
+            "{reference:?}"
+        );
+        let independent = independent_ref::execute(code, input).unwrap_err();
+        assert!(independent.starts_with("0x10:"), "{independent}");
+    }
+
     fn check(input: &[u32]) {
         let expected: Vec<_> = input
             .iter()
             .map(|&x| ((u64::from(x) + 0x1234_5678) % (1_u64 << 32)) as u32)
             .collect();
         assert_eq!(xenora_ref::execute(FIXTURE, input).unwrap(), expected);
+    }
+
+    const IMAGE_SAMPLE_LZ_DMASK1: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-lz-dmask1.bin");
+    const IMAGE_SAMPLE_LZ_DMASK8: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-lz-dmask8.bin");
+    const IMAGE_SAMPLE_LZ_DMASK5: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-lz-dmask5.bin");
+    const IMAGE_SAMPLE_LZ_DMASKF: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-lz-dmaskf.bin");
+    const IMAGE_SAMPLE_L_LOD0: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-l-lod0.bin");
+    const IMAGE_SAMPLE_L_LOD1: &[u8] =
+        include_bytes!("../../fixtures/rdna2/image-sample-l-lod1.bin");
+
+    /// The 20 per-lane (u, v) cases. Every value has a zero low 16-bit half so
+    /// the fixture can pack both into one word (see `packed`).
+    const IMAGE_SAMPLE_CASES: [(f32, f32); 20] = [
+        (0.125, 0.125), // mip 0 texel (0, 0) centre
+        (0.375, 0.125), // texel (1, 0)
+        (0.625, 0.125), // texel (2, 0)
+        (0.875, 0.125), // texel (3, 0)
+        (0.125, 0.375), // texel (0, 1)
+        (0.125, 0.625), // texel (0, 2)
+        (0.125, 0.875), // texel (0, 3)
+        (0.875, 0.875), // texel (3, 3)
+        (0.25, 0.25),   // exactly on the edge: 0.25 * 4 = 1.0
+        (0.5, 0.5),     // exactly on the edge: 0.5 * 4 = 2.0
+        (-0.5, 0.125),  // u < 0 clamps to x = 0
+        (1.5, 0.125),   // u > 1 clamps to x = 3
+        (0.125, 1.5),   // v > 1 clamps to y = 3
+        (-0.5, -0.5),   // both clamp to the first texel
+        (1.5, 1.5),     // both clamp to the last texel
+        (0.0, 0.0),     // first texel
+        (1.0, 1.0),     // last texel
+        (0.75, 0.25),   // texel (3, 1)
+        (0.25, 0.75),   // texel (1, 3)
+        (0.5, 0.25),    // texel (2, 1)
+    ];
+
+    fn packed(u: f32, v: f32) -> u32 {
+        (u.to_bits() >> 16) | (v.to_bits() & 0xffff_0000)
+    }
+
+    /// Texel byte `(level << 6) | (y << 4) | (x << 2) | channel` makes every
+    /// channel of every texel distinct.
+    fn texel_byte(level: u32, x: usize, y: usize, channel: usize) -> u8 {
+        ((level << 6) | ((y as u32) << 4) | ((x as u32) << 2) | channel as u32) as u8
+    }
+
+    fn image_sample_texels() -> Vec<u32> {
+        let mut bytes = Vec::new();
+        for level in 0..2u32 {
+            let extent = 4usize >> level;
+            for y in 0..extent {
+                for x in 0..extent {
+                    for channel in 0..4 {
+                        bytes.push(texel_byte(level, x, y, channel));
+                    }
+                }
+            }
+        }
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect()
+    }
+
+    /// The synthetic input: a 4x4 RGBA8 unorm T# with two levels (base field 1
+    /// = byte offset 0x100), an S# with point mip filtering and a 1.0 maximum
+    /// LOD, the 20 packed coordinate cases at words 12..32, and the texels at
+    /// word 64.
+    fn image_sample_input() -> Vec<u32> {
+        let mut input = vec![
+            0x0000_0001, // T# base-address field 1 -> byte offset 0x100
+            0xC380_0000, // min lod 0, format 56, width-1 3 high bits
+            0x8000_C000, // width-1 3 low bits, height-1 3, resource level 1
+            0x9001_0fac, // dst_sel RGBA, base 0, last 1, type 9 (2D)
+            0,
+            0,
+            0,
+            0,           // 256-bit extension words (zero for a 2D texture)
+            0x0000_0092, // S# clamp_x/y/z = ClampLastTexel (2)
+            0x0010_0000, // S# max lod 0x100 = 1.0 (4.8 fixed point)
+            0x0400_0000, // S# mip filter point (1) at 91:90
+            0,
+        ];
+        input.extend(IMAGE_SAMPLE_CASES.map(|(u, v)| packed(u, v)));
+        input.resize(64, 0);
+        input.extend(image_sample_texels());
+        input
+    }
+
+    fn texel_index(u: f32, v: f32, mip: u32) -> (usize, usize) {
+        let extent = 4usize >> mip;
+        let x = ((u.clamp(0.0, 1.0) * extent as f32).floor() as usize).min(extent - 1);
+        let y = ((v.clamp(0.0, 1.0) * extent as f32).floor() as usize).min(extent - 1);
+        (x, y)
+    }
+
+    /// One output word per dispatch index. Every lane loads its packed coordinate
+    /// word `input[lane]`, splits it into u and v, and samples `component` of the
+    /// mip. The non-case words (descriptors and texel bytes) are still finite
+    /// coordinates and follow the same formula.
+    fn image_sample_expected(input: &[u32], mip: u32, component: usize) -> Vec<u32> {
+        input
+            .iter()
+            .map(|&word| {
+                let u = f32::from_bits((word & 0xffff) << 16);
+                let v = f32::from_bits(word & 0xffff_0000);
+                let (x, y) = texel_index(u, v, mip);
+                (f32::from(texel_byte(mip, x, y, component)) / 255.0).to_bits()
+            })
+            .collect()
+    }
+
+    /// The destination VGPR of every DMASK-selected component, in R, G, B, A
+    /// order of the set bits. VDATA is v5.
+    fn image_sample_destinations(dmask: u8) -> Vec<(u8, usize)> {
+        let mut destinations = Vec::new();
+        let mut slot = 5u8;
+        for component in 0..4 {
+            if dmask & (1 << component) != 0 {
+                destinations.push((slot, component));
+                slot += 1;
+            }
+        }
+        destinations
+    }
+
+    /// Rewrite the single output store to read a different destination VGPR, so
+    /// every component the sample wrote can be observed. The store is the third
+    /// instruction from the end (store, vscnt wait, endpgm).
+    fn store_destination(code: &[u8], vgpr: u8) -> Vec<u8> {
+        let mut code = code.to_vec();
+        let store = code.len() - 16;
+        assert_eq!(code[store + 7], 0x80, "buffer_store encoding");
+        code[store + 5] = vgpr;
+        code
+    }
+
+    #[test]
+    fn image_sample_lz_dmask_matrix_matches_independent_reference() {
+        let input = image_sample_input();
+        let fixtures: [(&[u8], u8); 4] = [
+            (IMAGE_SAMPLE_LZ_DMASK1, 0x1),
+            (IMAGE_SAMPLE_LZ_DMASK8, 0x8),
+            (IMAGE_SAMPLE_LZ_DMASK5, 0x5),
+            (IMAGE_SAMPLE_LZ_DMASKF, 0xf),
+        ];
+        for (fixture, dmask) in fixtures {
+            for (destination, component) in image_sample_destinations(dmask) {
+                let code = store_destination(fixture, destination);
+                let expected = image_sample_expected(&input, 0, component);
+                verify(&code, &input, Some(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn image_sample_l_reads_lod_zero_and_one() {
+        let input = image_sample_input();
+        for (fixture, mip) in [(IMAGE_SAMPLE_L_LOD0, 0u32), (IMAGE_SAMPLE_L_LOD1, 1)] {
+            for (destination, component) in image_sample_destinations(0xf) {
+                let code = store_destination(fixture, destination);
+                let expected = image_sample_expected(&input, mip, component);
+                verify(&code, &input, Some(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn image_sample_fixtures_carry_the_expected_mimg_form() {
+        for (fixture, dmask, explicit) in [
+            (IMAGE_SAMPLE_LZ_DMASK1, 0x1u8, false),
+            (IMAGE_SAMPLE_LZ_DMASK8, 0x8, false),
+            (IMAGE_SAMPLE_LZ_DMASK5, 0x5, false),
+            (IMAGE_SAMPLE_LZ_DMASKF, 0xf, false),
+            (IMAGE_SAMPLE_L_LOD0, 0xf, true),
+            (IMAGE_SAMPLE_L_LOD1, 0xf, true),
+        ] {
+            let program = xenora_ref::decode(fixture).expect("decode image sample fixture");
+            assert!(program.iter().any(|instruction| matches!(
+                instruction.op,
+                xenora_ref::Op::ImageSample {
+                    dst: 5,
+                    coord: 2,
+                    resource: 8,
+                    sampler: 16,
+                    dmask: actual,
+                    explicit_lod: actual_lod,
+                } if actual == dmask && actual_lod == explicit
+            )));
+        }
     }
 
     #[test]
@@ -516,7 +730,7 @@ mod review {
     }
 
     #[test]
-    fn float_results_and_rejections_follow_the_exact_domain() {
+    fn float_results_and_rejections_follow_the_guide_domain() {
         let fixture = include_bytes!("../../fixtures/rdna2/float-exact.bin");
         let input = [
             0,
@@ -542,19 +756,38 @@ mod review {
         assert_eq!(xenora_ref::execute(fixture, &input).unwrap(), expected);
         assert!(compile(Architecture::Gfx1030, fixture).is_ok());
 
-        for rejected_literal in [1_u32, 0x3380_0000, 0x0080_0000, 0xff80_0000] {
-            // Subnormal, midpoint rounding at 1, binary64 absorption, infinity.
+        // The guide's rule for the arithmetic forms (12.7, page 131) is a plain
+        // IEEE binary32 operation: it has no sign restriction and no
+        // exactness requirement, so these constants are computed rather than
+        // refused. The values are hand-derived; the fixture computes
+        // (x + c) * c with x = 1 for the input below.
+        //   c = 2^-24: 1 + 2^-24 is the midpoint between 1 and 1 + 2^-23, so it
+        //     rounds to the even one, 1, and 1 * 2^-24 = 2^-24.
+        //   c = 2^-126: 1 + 2^-126 rounds to 1, and 1 * 2^-126 = 2^-126.
+        //   c = -inf: 1 + (-inf) = -inf, and (-inf) * (-inf) = +inf.
+        for (constant, value) in [
+            (0x3380_0000u32, 0x3380_0000u32),
+            (0x0080_0000, 0x0080_0000),
+            (0xff80_0000, 0x7f80_0000),
+        ] {
             let mut changed = *fixture;
-            changed[36..40].copy_from_slice(&rejected_literal.to_le_bytes());
+            changed[36..40].copy_from_slice(&constant.to_le_bytes());
             assert!(
-                compile(Architecture::Gfx1030, &changed).is_err(),
-                "{rejected_literal:08x}"
+                compile(Architecture::Gfx1030, &changed).is_ok(),
+                "{constant:08x}"
             );
-            assert!(
-                xenora_ref::execute(&changed, &[0]).is_err(),
-                "{rejected_literal:08x}"
+            assert_eq!(
+                xenora_ref::execute(&changed, &[0]).unwrap(),
+                vec![value],
+                "{constant:08x}"
             );
         }
+        // A subnormal operand is outside the domain: Metal flushes it, so the
+        // interpreters refuse it at run time rather than return a value the
+        // two paths would not agree on.
+        let mut subnormal = *fixture;
+        subnormal[36..40].copy_from_slice(&1u32.to_le_bytes());
+        assert!(xenora_ref::execute(&subnormal, &[0]).is_err());
     }
 
     #[test]
@@ -606,37 +839,37 @@ mod review {
     }
 
     #[test]
-    fn binary32_boundaries_follow_exact_significand_arithmetic() {
+    fn binary32_boundaries_follow_the_guide_domain() {
         const ADD: u32 = 0x0602_0702;
         const MUL: u32 = 0x1002_0702;
         let input = [0, 0x0040_0000, u32::MAX];
         let one = 0x3f80_0000;
         let min_normal = 0x0080_0000;
         let max_normal = 0x7f7f_ffff;
+        // The guide's arithmetic forms (12.7, page 131) are plain IEEE
+        // binary32 operations, so a value outside the old "positive, normal,
+        // exact" subset is computed whenever the two paths agree on it. The
+        // expectations are hand-derived: the rounding is to nearest with ties
+        // to even (MODE.FP_ROUND pinned to 0, guide 3.5 page 15), an overflow
+        // gives a signed infinity, and +0 equals -0.
         for (op, a, b, expected) in [
             (ADD, one, 0x3400_0000, Some(0x3f80_0001)), // 1 + 2^-23
             (ADD, 0x3f7f_ffff, 0x3380_0000, Some(one)), // (1 - 2^-24) + 2^-24
             (ADD, min_normal, min_normal, Some(0x0100_0000)), // 2^-125
-            (ADD, one, 0x3380_0000, None),              // Midpoint 1 + 2^-24
-            (ADD, one, min_normal, None), // Absorbed in binary64 if computed in host FP
-            (ADD, max_normal, max_normal, None), // Overflow
             (MUL, 0x3fc0_0000, 0x3fc0_0000, Some(0x4010_0000)), // (3/2)^2 = 9/4
-            (MUL, 0x7e80_0000, min_normal, Some(one)), // 2^126 × 2^-126
+            (MUL, 0x7e80_0000, min_normal, Some(one)),  // 2^126 × 2^-126
             (MUL, max_normal, one, Some(max_normal)),
-            (MUL, 0x4580_0800, 0x4580_0800, None), // 4097² = 16,785,409, an odd integer
-            (MUL, min_normal, 0x3f00_0000, None),  // 2^-127 is subnormal
-            (MUL, max_normal, 0x4000_0000, None),  // Overflow
-            (ADD, 0, one, None),                   // Positive zero
-            (ADD, one, 0x8000_0000, None),         // Negative zero
-            (ADD, 0xbf80_0000, 0x4000_0000, None), // Result normal, operand negative
-            (ADD, 0x4000_0000, 0xbf80_0000, None), // Same result, other operand negative
-            (ADD, one, 1, None),                   // Smallest positive subnormal
-            (MUL, 1, 0x7e80_0000, None), // Subnormal operand would yield exact normal 2^-23
-            (MUL, 0x7e80_0000, 1, None),
-            (ADD, one, 0x7f80_0000, None), // Infinity
-            (MUL, 0xff80_0000, one, None), // Negative infinity
-            (ADD, one, 0x7fc0_0001, None), // Quiet NaN with payload
-            (MUL, 0x7f80_0001, one, None), // Signaling NaN with payload
+            (ADD, one, 0x3380_0000, Some(one)), // Midpoint 1 + 2^-24, ties to even
+            (ADD, one, min_normal, Some(one)),  // 1 + 2^-126 rounds to 1
+            (ADD, max_normal, max_normal, Some(0x7f80_0000)), // Overflow
+            (MUL, 0x4580_0800, 0x4580_0800, Some(0x4b80_1000)), // 4097² is a midpoint, so it rounds to even
+            (MUL, max_normal, 0x4000_0000, Some(0x7f80_0000)),  // Overflow
+            (ADD, 0, one, Some(one)),                           // Positive zero
+            (ADD, one, 0x8000_0000, Some(one)),                 // Negative zero
+            (ADD, 0xbf80_0000, 0x4000_0000, Some(one)),         // Result normal, operand negative
+            (ADD, 0x4000_0000, 0xbf80_0000, Some(one)), // Same result, other operand negative
+            (ADD, one, 0x7f80_0000, Some(0x7f80_0000)), // Infinity
+            (MUL, 0xff80_0000, one, Some(0xff80_0000)), // Negative infinity
         ] {
             // Force literal moves into v2 and v3. VOP2 writes v1, the existing
             // store source. The exact words were cross-checked with gfx1030 llvm-mc.
@@ -648,6 +881,22 @@ mod review {
                 &input,
                 expected.as_ref().map(|values| values.as_slice()),
             );
+        }
+        // A subnormal operand or result is outside the domain: Metal flushes
+        // it, so the interpreters refuse it at run time. The encoding itself is
+        // valid and the compiler accepts it, because the operands are in
+        // VGPRs and it cannot see their values.
+        for (op, a, b) in [
+            (MUL, min_normal, 0x3f00_0000), // 2^-127 is subnormal
+            (ADD, one, 1),                  // Smallest positive subnormal
+            (MUL, 1, 0x7e80_0000),          // Subnormal operand would yield exact normal 2^-23
+            (MUL, 0x7e80_0000, 1),
+            (ADD, one, 0x7fc0_0001), // Quiet NaN with payload
+            (MUL, 0x7f80_0001, one), // Signaling NaN with payload
+        ] {
+            let mut code = words(&[0x7e04_02ff, a, 0x7e06_02ff, b, op]);
+            code.extend_from_slice(&FIXTURE[28..]);
+            verify_refused_at_run_time(&code, &input);
         }
     }
 

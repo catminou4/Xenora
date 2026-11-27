@@ -937,6 +937,64 @@ impl StandardStreams {
         }
     }
 
+    /// `__stdio_common_vfscanf` and its secure variant read a byte-oriented
+    /// stream. The cursor follows input actually consumed and a read that
+    /// meets end-of-file sets the existing indicator.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan(
+        &mut self,
+        memory: &mut GuestMemory,
+        drive: &ObjectState,
+        options: u64,
+        file: u64,
+        format: u64,
+        locale: u64,
+        arguments: u64,
+    ) -> Outcome<i32> {
+        use super::crt_scan::{Bytes, EOF, Request};
+        if file == 0 || format == 0 {
+            return Ok(Err(Failed(EOF, EINVAL)));
+        }
+        let stream = self.stream(file)?;
+        let request = Request::read(memory, options, format, locale)?;
+        let scanned = match stream {
+            Stream::Input => {
+                if !self.input.orient(false) {
+                    return Ok(Err(Failed(EOF, EBADF)));
+                }
+                // The hosted input has already had its CRLFs translated.
+                let mut source = Bytes {
+                    bytes: &self.input.bytes,
+                    at: self.input.position,
+                    text: false,
+                };
+                let pending = request.scan(memory, &mut source, arguments);
+                let scanned = pending.finish(memory)?;
+                self.input.position = source.at;
+                self.input.eof |= scanned.met_end;
+                scanned
+            }
+            Stream::File(file) => {
+                let (bytes, start, text) = match self.opened.reading(drive, file) {
+                    Ok(reading) => reading,
+                    Err(errno) => return Ok(Err(Failed(EOF, errno))),
+                };
+                let mut source = Bytes {
+                    bytes,
+                    at: start,
+                    text,
+                };
+                let pending = request.scan(memory, &mut source, arguments);
+                let scanned = pending.finish(memory)?;
+                self.opened
+                    .finish_scan(file, source.at - start, scanned.met_end);
+                scanned
+            }
+            Stream::Output | Stream::Error => return Ok(Err(Failed(EOF, EBADF))),
+        };
+        Ok(Ok(scanned.result))
+    }
+
     /// `rewind`: back to the start of the stream, clearing the end-of-file
     /// and error indicators as the documentation requires, which is what
     /// separates it from a bare `fseek` to zero. A standard stream, which

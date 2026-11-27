@@ -26,7 +26,13 @@ include = [
   "rdna2/vopc.toml",
   "rdna2/vop3.toml",
   "rdna2/sopp.toml",
+  "rdna2/mimg.toml",
 ]
+
+# The MIMG family is added to an existing table. It is rendered after the
+# encoding-variant rows so every pre-existing generated form and variant keeps
+# its exact position; this is an additive schema key for #215.
+append_after_variants = ["MIMG"]
 
 # Named public documents that spec references point at.
 [documents.guide]

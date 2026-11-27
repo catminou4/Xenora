@@ -71,6 +71,13 @@ pub enum CompileError {
         offset: usize,
         reason: &'static str,
     },
+    /// An image sample must read descriptors that were loaded into s[8:19] by
+    /// the synthetic binding ABI's `s_buffer_load_dwordx4` sequence.
+    DescriptorProvenance {
+        offset: usize,
+        register: u8,
+        expected: &'static str,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -89,6 +96,14 @@ impl fmt::Display for CompileError {
                     "shader verification at byte 0x{offset:x}: {reason}"
                 )
             }
+            Self::DescriptorProvenance {
+                offset,
+                register,
+                expected,
+            } => write!(
+                formatter,
+                "shader verification at byte 0x{offset:x}: s{register} was not written by {expected}"
+            ),
         }
     }
 }
@@ -188,6 +203,19 @@ enum Op {
     /// The value is the earlier pure result `source`. The definition index stays
     /// so later operands do not need renumbering.
     Reuse(Value),
+    /// MIMG 2D texture sample: the selected channel of
+    /// `tex0.sample(samp0, float2(u, v), level(lod))` as float bits. The texture
+    /// and sampler are the synthetic ABI bindings, not register operands.
+    /// `exec` is the compile-time EXEC mask: only its lanes check the sample
+    /// domain (finite coordinates and, for `explicit_lod`, a whole mip level).
+    Sample {
+        u: Value,
+        v: Value,
+        lod: Value,
+        component: u8,
+        explicit_lod: bool,
+        exec: u32,
+    },
 }
 
 impl Op {
@@ -224,6 +252,7 @@ impl Op {
                 ..
             } => vec![mask, fallthrough, taken],
             Self::Reuse(source) => vec![source],
+            Self::Sample { u, v, lod, .. } => vec![u, v, lod],
         }
     }
 
@@ -257,13 +286,8 @@ impl Op {
             }
             Self::Binary(operator, left, right) => {
                 let (left, right) = (name(left), name(right));
-                let (_, symbol) = operator.operator();
-                match operator {
-                    Binary::FloatAdd | Binary::FloatMul => format!(
-                        "as_type<uint>(as_type<float>({left}) {symbol} as_type<float>({right}))"
-                    ),
-                    Binary::Vector(operation) => vector_expression(operation, &left, &right),
-                }
+                let Binary::Vector(operation) = operator;
+                vector_expression(operation, &left, &right)
             }
             Self::MergeLanes {
                 mask,
@@ -309,6 +333,21 @@ impl Op {
                 }
             }
             Self::Reuse(source) => name(source),
+            Self::Sample {
+                u,
+                v,
+                lod,
+                component,
+                ..
+            } => {
+                let channel = ["r", "g", "b", "a"][usize::from(component)];
+                format!(
+                    "as_type<uint>(tex0.sample(samp0, float2(as_type<float>({}), as_type<float>({})), level(as_type<float>({}))).{channel})",
+                    name(u),
+                    name(v),
+                    name(lod),
+                )
+            }
             Self::ScalarTest {
                 relation,
                 signed,
@@ -378,18 +417,18 @@ fn compare_expression(op: VectorCompareOp, left: &str, right: &str) -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Binary {
-    FloatAdd,
-    FloatMul,
-    /// A registry VOP2 integer operation (or its VOP3 encoding), lowered by its
-    /// typed template.
+    /// A registry VOP2 integer or binary32 operation (or a VOP3 integer
+    /// encoding), lowered by its typed template.
     Vector(VectorBinary),
 }
 
 impl Binary {
     fn operator(self) -> (&'static str, &'static str) {
         match self {
-            Self::FloatAdd => ("add.f32", "+"),
-            Self::FloatMul => ("mul.f32", "*"),
+            // The graphics path prints binary32 values with these symbols.
+            Self::Vector(VectorBinary::AddF32) => ("add.f32", "+"),
+            Self::Vector(VectorBinary::SubF32) => ("sub.f32", "-"),
+            Self::Vector(VectorBinary::MulF32) => ("mul.f32", "*"),
             Self::Vector(operation) => (
                 match operation {
                     VectorBinary::Add => "add.u32",
@@ -409,6 +448,11 @@ impl Binary {
                     VectorBinary::ShiftLeft => "lshl.b32",
                     VectorBinary::ShiftRight => "lshr.b32",
                     VectorBinary::ArithmeticShiftRight => "ashr.i32",
+                    VectorBinary::MinF32 => "min.f32",
+                    VectorBinary::MaxF32 => "max.f32",
+                    VectorBinary::AddF32 | VectorBinary::SubF32 | VectorBinary::MulF32 => {
+                        unreachable!("binary32 arithmetic has a symbol")
+                    }
                 },
                 "",
             ),
@@ -452,7 +496,45 @@ fn vector_expression(operation: VectorBinary, left: &str, right: &str) -> String
         VectorBinary::ArithmeticShiftRight => {
             format!("as_type<uint>(as_type<int>({left}) >> ({right} & 31u))")
         }
+        // Guide 12.7 page 131: IEEE binary32 arithmetic, rounded to nearest
+        // even. The kernel turns off contraction and reassociation, and the
+        // library is built in safe math mode. Metal flushes subnormal inputs
+        // and results, which the interpreters refuse (vector-binary-f32.md).
+        VectorBinary::AddF32 => float_arithmetic(left, "+", right),
+        VectorBinary::SubF32 => float_arithmetic(left, "-", right),
+        VectorBinary::MulF32 => float_arithmetic(left, "*", right),
+        VectorBinary::MinF32 => float_select_expression(true, left, right),
+        VectorBinary::MaxF32 => float_select_expression(false, left, right),
     }
+}
+
+fn float_arithmetic(left: &str, symbol: &str, right: &str) -> String {
+    format!("as_type<uint>(as_type<float>({left}) {symbol} as_type<float>({right}))")
+}
+
+/// Guide 12.7 V_MIN_F32 (page 132) and V_MAX_F32 (page 133) on the register
+/// bits, with no Metal float operation (`fmin` and `fmax` differ on signed
+/// zeros): a NaN operand gives the other operand (S1 when both are NaN; the
+/// interpreters refuse signalling NaNs), a +0/-0 pair gives -0 for MIN and +0
+/// for MAX, and otherwise the sign-magnitude words are compared as ordered
+/// keys (S0 < S1 ? S0 : S1, or S0 >= S1 ? S0 : S1).
+fn float_select_expression(minimum: bool, left: &str, right: &str) -> String {
+    let nan = |value: &str| format!("({value} & 0x7fffffffu) > 0x7f800000u");
+    let key = |value: &str| {
+        format!("({value} ^ (as_type<uint>(as_type<int>({value}) >> 31) | 0x80000000u))")
+    };
+    let (zeros, order) = if minimum {
+        (format!("{left} | {right}"), "<")
+    } else {
+        (format!("{left} & {right}"), ">=")
+    };
+    format!(
+        "{} ? {right} : {} ? {left} : (({left} | {right}) & 0x7fffffffu) == 0u ? ({zeros}) : {} {order} {} ? {left} : {right}",
+        nan(left),
+        nan(right),
+        key(left),
+        key(right)
+    )
 }
 
 // Each bit is either known zero, known one or unconstrained.
@@ -501,62 +583,6 @@ impl KnownBits {
             values: None,
         }
     }
-
-    fn positive_normal_candidates(self) -> Option<[f32; 2]> {
-        let values = match self.values {
-            Some(values) => values,
-            None => {
-                let unknown = !(self.zero | self.one);
-                if unknown.count_ones() > 1 {
-                    return None;
-                }
-                [self.one, self.one | unknown]
-            }
-        };
-        let candidates = values.map(f32::from_bits);
-        candidates
-            .iter()
-            .all(|n| n.is_normal() && n.is_sign_positive())
-            .then_some(candidates)
-    }
-}
-
-fn exact_float_result(operator: Binary, left: KnownBits, right: KnownBits) -> Option<KnownBits> {
-    let left = left.positive_normal_candidates()?;
-    let right = right.positive_normal_candidates()?;
-    let mut zero = u32::MAX;
-    let mut one = u32::MAX;
-    let mut results = Vec::with_capacity(4);
-    for a in left.map(f64::from) {
-        for b in right.map(f64::from) {
-            let exact = match operator {
-                Binary::FloatAdd => a + b,
-                Binary::FloatMul => a * b,
-                _ => return None,
-            };
-            let value = exact as f32;
-            if !value.is_normal() || f64::from(value) != exact {
-                return None;
-            }
-            // Binary64 can round away the smaller operand of a widely separated
-            // binary32 sum. Require that subtraction recovers the smaller input.
-            if matches!(operator, Binary::FloatAdd) && exact - a.max(b) != a.min(b) {
-                return None;
-            }
-            let bits = value.to_bits();
-            zero &= !bits;
-            one &= bits;
-            if !results.contains(&bits) {
-                results.push(bits);
-            }
-        }
-    }
-    let values = match results.as_slice() {
-        [only] => Some([*only; 2]),
-        [first, second] => Some([*first, *second]),
-        _ => None,
-    };
-    Some(KnownBits { zero, one, values })
 }
 
 /// Compiles explicitly tagged raw machine code to a synthetic Metal compute kernel.
@@ -598,13 +624,28 @@ pub fn compile_with(
     } else {
         ""
     };
+    let samples = operations
+        .iter()
+        .any(|(_, operation)| matches!(operation, Op::Sample { .. }));
+    // A texture and sampler pair must precede the grid attribute, so the
+    // parameter list is built in one piece instead of rewriting the signature.
+    let sampled = if samples {
+        "    texture2d<float, access::sample> tex0 [[texture(0)]],\n    sampler samp0 [[sampler(0)]],\n    device atomic_uint* fault [[buffer(2)]],\n"
+    } else {
+        ""
+    };
+    let helpers = if samples { SAMPLE_DOMAIN_HELPERS } else { "" };
     let mut msl = format!(
-        "#include <metal_stdlib>\nusing namespace metal;\nkernel void {ENTRY_POINT}(\n    device const uint* input [[buffer(0)]],\n    device uint* output [[buffer(1)]],\n    uint index [[thread_position_in_grid]]{grid}) {{\n"
+        "#include <metal_stdlib>\nusing namespace metal;\n{helpers}kernel void {ENTRY_POINT}(\n    device const uint* input [[buffer(0)]],\n    device uint* output [[buffer(1)]],\n{sampled}    uint index [[thread_position_in_grid]]{grid}) {{\n"
     );
     if operations.iter().any(|(_, operation)| {
         matches!(
             operation,
-            Op::Binary(Binary::FloatAdd | Binary::FloatMul, _, _)
+            Op::Binary(
+                Binary::Vector(VectorBinary::AddF32 | VectorBinary::SubF32 | VectorBinary::MulF32,),
+                _,
+                _
+            ) | Op::Sample { .. }
         )
     }) {
         msl.push_str("    #pragma clang fp contract(off)\n    #pragma clang fp reassociate(off)\n");
@@ -795,6 +836,39 @@ pub fn compile_with(
                 format!("{dest} = reuse.u32 {source}"),
                 format!("uint {dest} = {source};"),
             ),
+            Op::Sample {
+                u,
+                v,
+                lod,
+                component,
+                explicit_lod,
+                exec,
+            } => {
+                let channel = ["r", "g", "b", "a"][usize::from(component)];
+                let (form, level, lod_check) = if explicit_lod {
+                    (
+                        "sample_l.2d.f32",
+                        format!(", lod {lod}"),
+                        format!(
+                            " if (!xenora_whole_level({lod}, tex0.get_num_mip_levels())) {{ bad |= {SAMPLE_FAULT_LOD}u; }}"
+                        ),
+                    )
+                } else {
+                    ("sample_lz.2d.f32", String::new(), String::new())
+                };
+                let active = if exec == u32::MAX {
+                    String::new()
+                } else {
+                    format!(" && ((0x{exec:08x}u >> (index & 31u)) & 1u) != 0u")
+                };
+                (
+                    format!("{form} tex0, samp0, ({u}, {v}){level}[{channel}] exec=0x{exec:08x}"),
+                    format!(
+                        "{{ uint bad = 0u; if (!xenora_finite({u}) || !xenora_finite({v})) {{ bad |= {SAMPLE_FAULT_COORDINATES}u; }}{lod_check} if (bad != 0u{active}) {{ atomic_fetch_or_explicit(fault, bad, memory_order_relaxed); }} }}\n    uint {dest} = {};",
+                        operation.expression(&thread, "", "")
+                    ),
+                )
+            }
         };
         // Writing to a String is infallible.
         let _ = writeln!(ir, "{offset:04x}: {step}");
@@ -916,6 +990,56 @@ fn scalar_load_pending(scalars: &[ScalarValue]) -> bool {
         .any(|value| matches!(value, ScalarValue::Pending(_)))
 }
 
+/// Bit set in the `[[buffer(2)]]` fault word when an active lane's explicit LOD
+/// is not a whole mip level of the bound texture (the reference's `InvalidLod`).
+pub const SAMPLE_FAULT_LOD: u32 = 1;
+/// Bit set in the fault word when an active lane's coordinate is NaN or
+/// infinite (the reference's `NonFiniteCoordinates`).
+pub const SAMPLE_FAULT_COORDINATES: u32 = 2;
+
+/// MSL helpers for the sample domain check. Both compare raw bits, so the
+/// check does not depend on the compiler's floating-point mode. A whole level
+/// is -0.0 or the exact binary32 value of a level below `levels`, the domain
+/// `xenora_ref::texture_sampling::lod_to_mip` accepts.
+const SAMPLE_DOMAIN_HELPERS: &str = "static inline bool xenora_finite(uint bits) {\n    return (bits & 0x7f800000u) != 0x7f800000u;\n}\nstatic inline bool xenora_whole_level(uint bits, uint levels) {\n    if (bits == 0x80000000u) { return true; }\n    for (uint level = 0u; level < levels; ++level) {\n        if (bits == as_type<uint>(float(level))) { return true; }\n    }\n    return false;\n}\n";
+
+/// The synthetic binding ABI load that may provide descriptor register `slot`.
+fn descriptor_load(slot: usize) -> Option<(usize, u32, &'static str)> {
+    match slot {
+        8..=11 => Some((8, 0x0, "s_buffer_load_dwordx4 s[8:11], s[0:3], 0x0")),
+        12..=15 => Some((12, 0x10, "s_buffer_load_dwordx4 s[12:15], s[0:3], 0x10")),
+        16..=19 => Some((16, 0x20, "s_buffer_load_dwordx4 s[16:19], s[0:3], 0x20")),
+        _ => None,
+    }
+}
+
+/// Forget the provenance of a descriptor register after any other write.
+fn clear_descriptor_origin(origins: &mut [Option<u32>; 128], register: usize) {
+    if (8..20).contains(&register) {
+        origins[register] = None;
+    }
+}
+
+/// Every image sample reads the three synthetic descriptor loads in order.
+fn verify_descriptor_provenance(
+    origins: &[Option<u32>; 128],
+    offset: usize,
+) -> Result<(), CompileError> {
+    for (slot, origin) in origins.iter().enumerate().take(20).skip(8) {
+        let (base, expected_offset, expected) =
+            descriptor_load(slot).expect("descriptor registers are contiguous");
+        debug_assert_eq!(base, 8 + ((slot - 8) / 4) * 4);
+        if *origin != Some(expected_offset) {
+            return Err(CompileError::DescriptorProvenance {
+                offset,
+                register: slot as u8,
+                expected,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, Op)>, CompileError> {
     let mut operations = Vec::new();
     let mut registers = [None::<Value>; 256];
@@ -924,6 +1048,10 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
     let mut stored = false;
     let mut store_pending = false;
     let mut scalars = [ScalarValue::Uninitialized; 128];
+    // For s8..s19, the byte offset of the `s_buffer_load_dwordx4` that last
+    // wrote the register, or `None` after any other write. The image sample
+    // requires the synthetic binding ABI's three descriptor loads.
+    let mut descriptor_origin = [None::<u32>; 128];
     let mut exec = u32::MAX; // The fixture starts with full Wave32 EXEC.
     scalars[126] = ScalarValue::Known(exec);
     let mut scc = Scc::Uninitialized;
@@ -957,10 +1085,18 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
             Instruction::ScalarBufferLoad { resource, .. } if resource != 0 => {
                 "unsupported resource or buffer index"
             }
-            Instruction::Export { .. }
-            | Instruction::Interpolate { .. }
-            | Instruction::ImageSampleLz { .. } => {
+            Instruction::Export { .. } | Instruction::Interpolate { .. } => {
                 "graphics instruction is unsupported in a compute fixture"
+            }
+            Instruction::ImageSampleLz {
+                resource, sampler, ..
+            } if (resource, sampler) != (8, 16) => {
+                "sampling outside synthetic resource binding ABI s[8:15] and s[16:19]"
+            }
+            Instruction::ImageSampleL {
+                resource, sampler, ..
+            } if (resource, sampler) != (8, 16) => {
+                "sampling outside synthetic resource binding ABI s[8:15] and s[16:19]"
             }
             Instruction::EndProgram if index + 1 != decoded.len() => {
                 return Err(CompileError::Verify {
@@ -1147,8 +1283,6 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                 }
                 Instruction::MoveB32 { .. }
                 | Instruction::VectorAluVop3 { .. }
-                | Instruction::VectorAddF32 { .. }
-                | Instruction::VectorMulF32 { .. }
                 | Instruction::VectorAlu { .. }
                 | Instruction::VectorUnary { .. }
                 | Instruction::VectorSwap { .. } => continue,
@@ -1244,6 +1378,27 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                 }
                 for (slot, value) in (usize::from(dst)..).zip(loaded) {
                     scalars[slot] = ScalarValue::Pending(value);
+                }
+                // A scalar load writes every destination register. Record the
+                // synthetic descriptor loads so an image sample cannot consume
+                // arbitrary SGPR content.
+                for slot in usize::from(dst)..usize::from(dst) + usize::from(dwords) {
+                    clear_descriptor_origin(&mut descriptor_origin, slot);
+                }
+                let expected = if soffset.is_none() && dwords == 4 {
+                    match (dst, immediate) {
+                        (8, 0x0) => Some(0x0),
+                        (12, 0x10) => Some(0x10),
+                        (16, 0x20) => Some(0x20),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(expected) = expected {
+                    for slot in &mut descriptor_origin[usize::from(dst)..usize::from(dst) + 4] {
+                        *slot = Some(expected);
+                    }
                 }
                 continue;
             }
@@ -1366,6 +1521,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                     .get_mut(usize::from(dst))
                     .ok_or_else(|| error("scalar destination exceeds the fixture register file"))?;
                 *slot = ScalarValue::Known(value);
+                clear_descriptor_origin(&mut descriptor_origin, usize::from(dst));
                 continue;
             }
             Instruction::ScalarUnary { op, dst, src } => {
@@ -1385,6 +1541,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                     .get_mut(usize::from(dst))
                     .ok_or_else(|| error("scalar destination exceeds the fixture register file"))?;
                 *slot = ScalarValue::Known(value);
+                clear_descriptor_origin(&mut descriptor_origin, usize::from(dst));
                 if let Some(flag) = flag {
                     scc = Scc::Known(flag);
                 }
@@ -1411,6 +1568,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                     .get_mut(usize::from(dst))
                     .ok_or_else(|| error("scalar destination exceeds the fixture register file"))?;
                 *slot = ScalarValue::Known(value);
+                clear_descriptor_origin(&mut descriptor_origin, usize::from(dst));
                 if let Some(flag) = flag {
                     scc = Scc::Known(flag);
                 }
@@ -1480,6 +1638,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                 let (value, flag) = op.evaluate(old, simm16, scc_in);
                 if let Some(value) = value {
                     *slot = ScalarValue::Known(value);
+                    clear_descriptor_origin(&mut descriptor_origin, usize::from(dst));
                 }
                 if let Some(flag) = flag {
                     scc = Scc::Known(flag);
@@ -1543,6 +1702,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                         lane_vcc = None;
                     } else {
                         scalars[sdst] = ScalarValue::RuntimeMask;
+                        clear_descriptor_origin(&mut descriptor_origin, sdst);
                     }
                     continue;
                 }
@@ -1608,6 +1768,7 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                     lane_vcc = Some(mask);
                 } else {
                     scalars[sdst] = ScalarValue::RuntimeMask;
+                    clear_descriptor_origin(&mut descriptor_origin, sdst);
                 }
                 continue;
             }
@@ -1783,17 +1944,72 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
                 }
                 continue;
             }
-            Instruction::VectorAddF32 { dst, src0, src1 } => (
-                Some(dst),
-                Op::Binary(Binary::FloatAdd, read(src0)?, read(src1)?),
-            ),
-            Instruction::VectorMulF32 { dst, src0, src1 } => (
-                Some(dst),
-                Op::Binary(Binary::FloatMul, read(src0)?, read(src1)?),
-            ),
-            Instruction::Export { .. }
-            | Instruction::Interpolate { .. }
-            | Instruction::ImageSampleLz { .. } => {
+            Instruction::ImageSampleLz {
+                dst, coord, dmask, ..
+            }
+            | Instruction::ImageSampleL {
+                dst, coord, dmask, ..
+            } => {
+                // The synthetic binding (resource s[8:15] -> texture(0), sampler
+                // s[16:19] -> sampler(0)) was already checked in the verify loop.
+                // The descriptors must be the three s_buffer_load_dwordx4 words
+                // of the synthetic input, with no later writes before the sample.
+                if scalar_load_pending(&scalars) {
+                    return Err(error("image sample before the scalar descriptor load wait"));
+                }
+                verify_descriptor_provenance(&descriptor_origin, offset)?;
+                let explicit_lod =
+                    matches!(instruction.instruction, Instruction::ImageSampleL { .. });
+                let u = read(coord)?;
+                let v = read(coord + 1)?;
+                let lod = if explicit_lod {
+                    read(coord + 2)?
+                } else {
+                    let zero = Value(operations.len());
+                    facts.push(KnownBits::constant(0.0f32.to_bits()));
+                    operations.push((offset, Op::Constant(0.0f32.to_bits())));
+                    zero
+                };
+                // Guide Table 41, printed page 69: DMASK bit 0 = red, bit 1 =
+                // green, bit 2 = blue, bit 3 = alpha; selected components are
+                // written to consecutive destination VGPRs in that order.
+                let mut next_dst = dst;
+                for component in 0..4u8 {
+                    if dmask & (1 << component) == 0 {
+                        continue;
+                    }
+                    let sample = Value(operations.len());
+                    facts.push(KnownBits::UNKNOWN);
+                    operations.push((
+                        offset,
+                        Op::Sample {
+                            u,
+                            v,
+                            lod,
+                            component,
+                            explicit_lod,
+                            exec,
+                        },
+                    ));
+                    let slot = usize::from(next_dst);
+                    if next_dst == 0 || pending_load.is_some_and(|(register, _)| register == slot) {
+                        return Err(error(
+                            "instruction writes the index register or replaces a pending load",
+                        ));
+                    }
+                    registers[slot] = Some(merge_lanes(
+                        &mut operations,
+                        &mut facts,
+                        offset,
+                        exec,
+                        sample,
+                        registers[slot],
+                    )?);
+                    next_dst += 1;
+                }
+                continue;
+            }
+            Instruction::Export { .. } | Instruction::Interpolate { .. } => {
                 return Err(error(
                     "graphics instruction is unsupported in a compute fixture",
                 ));
@@ -1801,12 +2017,14 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
         };
         let value_bits = match operation {
             Op::Constant(bits) => KnownBits::constant(bits),
-            Op::Binary(Binary::Vector(VectorBinary::And), left, right) => facts[left.0].and(facts[right.0]),
-            Op::Binary(Binary::Vector(VectorBinary::Or), left, right) => facts[left.0].or(facts[right.0]),
-            Op::Binary(Binary::Vector(VectorBinary::Xor), left, right) => facts[left.0].xor(facts[right.0]),
-            Op::Binary(operator @ (Binary::FloatAdd | Binary::FloatMul), left, right) => {
-                exact_float_result(operator, facts[left.0], facts[right.0])
-                    .ok_or_else(|| error("FP32 operation is not proven exact for positive normal operands and results"))?
+            Op::Binary(Binary::Vector(VectorBinary::And), left, right) => {
+                facts[left.0].and(facts[right.0])
+            }
+            Op::Binary(Binary::Vector(VectorBinary::Or), left, right) => {
+                facts[left.0].or(facts[right.0])
+            }
+            Op::Binary(Binary::Vector(VectorBinary::Xor), left, right) => {
+                facts[left.0].xor(facts[right.0])
             }
             _ => KnownBits::UNKNOWN,
         };
@@ -1987,6 +2205,21 @@ fn map_uses(operation: Op, map: impl Fn(Value) -> Value) -> Op {
             taken: map(taken),
         },
         Op::Reuse(source) => Op::Reuse(map(source)),
+        Op::Sample {
+            u,
+            v,
+            lod,
+            component,
+            explicit_lod,
+            exec,
+        } => Op::Sample {
+            u: map(u),
+            v: map(v),
+            lod: map(lod),
+            component,
+            explicit_lod,
+            exec,
+        },
     }
 }
 
@@ -2035,17 +2268,6 @@ fn const_value(operations: &[(usize, Op)], value: Value) -> Option<u32> {
     match operations.get(value.0).map(|(_, operation)| *operation)? {
         Op::Constant(bits) => Some(bits),
         _ => None,
-    }
-}
-
-fn concrete_bits(facts: KnownBits) -> Option<u32> {
-    if let Some([first, second]) = facts.values {
-        return (first == second).then_some(first);
-    }
-    if facts.zero | facts.one == u32::MAX {
-        Some(facts.one)
-    } else {
-        None
     }
 }
 
@@ -2128,11 +2350,9 @@ fn eval_unary(operator: VectorUnary, source: u32) -> Option<u32> {
 
 fn eval_binary(operator: Binary, left: u32, right: u32) -> Option<u32> {
     match operator {
-        Binary::FloatAdd | Binary::FloatMul => concrete_bits(exact_float_result(
-            operator,
-            KnownBits::constant(left),
-            KnownBits::constant(right),
-        )?),
+        // Binary32 results are not folded on the CPU: the MSL is the only
+        // translator path for them.
+        Binary::Vector(operation) if operation.is_float() => None,
         Binary::Vector(operation) => Some(eval_vector_binary(operation, left, right)),
     }
 }
@@ -2162,6 +2382,11 @@ fn eval_vector_binary(operation: VectorBinary, left: u32, right: u32) -> u32 {
         VectorBinary::ShiftLeft => left << (right & 31),
         VectorBinary::ShiftRight => left >> (right & 31),
         VectorBinary::ArithmeticShiftRight => ((left as i32) >> (right & 31)) as u32,
+        VectorBinary::AddF32
+        | VectorBinary::SubF32
+        | VectorBinary::MulF32
+        | VectorBinary::MinF32
+        | VectorBinary::MaxF32 => unreachable!("binary32 operations are not folded"),
     }
 }
 
@@ -2214,8 +2439,8 @@ fn merge_lanes(
 #[cfg(test)]
 mod tests {
     use super::{
-        Binary, KnownBits, Op, Value, VectorBinary, VectorUnary, eval_unary, eval_vector_binary,
-        exact_float_result, vector_expression,
+        KnownBits, Op, Value, VectorBinary, VectorUnary, eval_unary, eval_vector_binary,
+        vector_expression,
     };
 
     /// Every foldable vector op must keep a matching MSL template and eval arm
@@ -2284,35 +2509,5 @@ mod tests {
         assert_eq!((and.zero, and.one), (!0b1000, 0b1000));
         let xor = left.xor(right);
         assert_eq!((xor.zero, xor.one), (!0b0110, 0b0110));
-    }
-
-    #[test]
-    fn rejects_unbounded_or_invalid_float_operands() {
-        let one = KnownBits::constant(1.0f32.to_bits());
-        let varying = KnownBits::UNKNOWN
-            .and(KnownBits::constant(0x0040_0000))
-            .xor(one);
-        assert_eq!(varying.positive_normal_candidates(), Some([1.0, 1.5]));
-        assert_eq!(one.and(one).positive_normal_candidates(), Some([1.0; 2]));
-        assert!(KnownBits::UNKNOWN.positive_normal_candidates().is_none());
-        for invalid in [0x8000_0000, 0xbf80_0000, 1, 0x7f80_0000] {
-            assert!(
-                KnownBits::constant(invalid)
-                    .positive_normal_candidates()
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn keeps_only_bits_shared_by_every_exact_result() {
-        let operand = KnownBits::UNKNOWN
-            .and(KnownBits::constant(0x0040_0000))
-            .xor(KnownBits::constant(1.0f32.to_bits()));
-        let sum = exact_float_result(Binary::FloatAdd, operand, operand).unwrap();
-        // The sums 2, 2.5 and 3 differ only in the two highest fraction bits.
-        assert_eq!(sum.zero, 0xbf9f_ffff);
-        assert_eq!(sum.one, 0x4000_0000);
-        assert!(sum.values.is_none());
     }
 }

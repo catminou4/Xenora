@@ -41,6 +41,10 @@ const IMPORTS: &[(&str, &str)] = &[
     (KERNEL32, "SetFileAttributesA"),
     (KERNEL32, "MoveFileExW"),
     (KERNEL32, "GetCompressedFileSizeA"),
+    ("msvcrt.dll", "_getcwd"),
+    ("msvcrt.dll", "_chdir"),
+    ("msvcrt.dll", "_fullpath"),
+    (KERNEL32, "CreateDirectoryA"),
     ("msvcrt.dll", "strstr"),
     ("msvcrt.dll", "strtok"),
     ("msvcrt.dll", "strcspn"),
@@ -408,6 +412,49 @@ fn the_compressed_size_is_the_size() {
         guest.call("GetCompressedFileSizeA", &[NAME6, 0]) & 0xFFFF_FFFF,
         0xFFFF_FFFF
     );
+}
+
+/// The CRT working directory: the root start, validated changes, lexical
+/// resolution, and the buffer-size contract.
+#[test]
+fn crt_working_directory_resolution_and_validation() {
+    const BUF: u64 = SCRATCH + 0x500;
+    const DIR: u64 = SCRATCH + 0x580;
+    const REL: u64 = SCRATCH + 0x5C0;
+    const OUT: u64 = SCRATCH + 0x600;
+    let mut guest = Guest::new(IMPORTS, &[]);
+    // The working directory starts at the volume root.
+    let wrote = guest.call("_getcwd", &[BUF, 260]);
+    assert_eq!(wrote, BUF);
+    let mut verify = [0u8; 8];
+    guest.memory.read_bytes(BUF, &mut verify).unwrap();
+    assert_eq!(&verify[..4], b"c:\\\0");
+    // A directory the filesystem does not have cannot be entered.
+    narrow_at(&mut guest, DIR, "C:\\nosuchdir");
+    assert_eq!(guest.call("_chdir", &[DIR]) as u32, u32::MAX);
+    // A directory the filesystem has can.
+    narrow_at(&mut guest, DIR, "c:\\testdir");
+    assert_eq!(guest.call("CreateDirectoryA", &[DIR, 0]), 1);
+    assert_eq!(guest.call("_chdir", &[DIR]), 0);
+    let wrote = guest.call("_getcwd", &[BUF, 260]);
+    assert_eq!(wrote, BUF);
+    let mut verify = [0u8; 16];
+    guest.memory.read_bytes(BUF, &mut verify).unwrap();
+    assert_eq!(&verify[..10], b"c:\\testdir");
+    // Relative and dot-segment paths resolve lexically.
+    narrow_at(&mut guest, REL, "sub\\..\\sibling");
+    let resolved = guest.call("_fullpath", &[OUT, REL, 260]);
+    assert_eq!(resolved, OUT);
+    let mut verify = [0u8; 24];
+    guest.memory.read_bytes(OUT, &mut verify).unwrap();
+    assert_eq!(&verify[..18], b"c:\\testdir\\sibling");
+    // A small buffer is ERANGE, and the root resolve works from anywhere.
+    assert_eq!(guest.call("_fullpath", &[OUT, REL, 4]), 0);
+    narrow_at(&mut guest, REL, "\\");
+    assert_eq!(guest.call("_fullpath", &[OUT, REL, 260]), OUT);
+    let mut verify = [0u8; 8];
+    guest.memory.read_bytes(OUT, &mut verify).unwrap();
+    assert_eq!(&verify[..3], b"c:\\");
 }
 
 /// The string search family: substring scans, span counts, the stateful
