@@ -31,8 +31,8 @@ class BootstrapTests(unittest.TestCase):
             self.executable(self.bin / tool, f"echo {tool}")
         self.executable(self.bin / "brew", '[ -n "$TEST_BREW_PREFIX" ] || exit 1\n'
                         'printf "%s\\n" "$TEST_BREW_PREFIX"')
-        self.executable(self.bin / "lipo", '[ "$1" = -verify_arch ] && [ "$2" = arm64 ] || exit 64\n'
-                        '[ "${3##*/}" != "$TEST_NON_NATIVE" ]')
+        self.executable(self.bin / "lipo", '[ "$2" = -verify_arch ] && [ "$3" = arm64 ] || exit 64\n'
+                        '[ "${1##*/}" != "$TEST_NON_NATIVE" ]')
         for tool in ("llvm-mc", "llvm-objcopy", "llvm-objdump"):
             self.executable(self.llvm / tool, f"echo {tool} version\necho full description")
 
