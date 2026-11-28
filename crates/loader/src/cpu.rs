@@ -186,6 +186,10 @@ pub const CPUID_LAHF_SAHF: u32 = 1;
 pub const CPUID_LZCNT: u32 = 1 << 5;
 /// CPUID leaf 0x8000_0001, EDX: 64-bit mode.
 pub const CPUID_LONG_MODE: u32 = 1 << 29;
+/// CPUID leaf 7 subleaf 0, EBX: bit-manipulation instruction set 1.
+pub const CPUID7_BMI1: u32 = 1 << 3;
+/// CPUID leaf 7 subleaf 0, EBX: bit-manipulation instruction set 2.
+pub const CPUID7_BMI2: u32 = 1 << 8;
 
 /// What the guest's CPUID returns in EAX, EBX, ECX and EDX.
 ///
@@ -193,11 +197,11 @@ pub const CPUID_LONG_MODE: u32 = 1 << 29;
 /// processor, not an Intel or AMD product, and sets a feature bit only when
 /// every instruction of that feature is implemented. A leaf that is not
 /// listed returns zeros.
-pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
+pub fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
     let word = |text: &[u8; 4]| u32::from_le_bytes(*text);
     match leaf {
         // Highest basic leaf, then "Xenora guest" in EBX, EDX, ECX.
-        0 => [1, word(b"Xeno"), word(b"uest"), word(b"ra g")],
+        0 => [7, word(b"Xeno"), word(b"uest"), word(b"ra g")],
         // No family, model or stepping: this is no shipped processor.
         1 => [
             0,
@@ -205,6 +209,28 @@ pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
             CPUID_CMPXCHG16B | CPUID_POPCNT,
             CPUID_TSC | CPUID_CX8 | CPUID_CMOV,
         ],
+        // Leaves 2 to 6 carry no content: leaf 2's legacy cache and TLB
+        // descriptors are zeros, which probing software reads as unknown
+        // geometry; leaf 3's processor serial number never existed after the
+        // Pentium III; leaf 4 zeros end the deterministic-cache enumeration
+        // at its first subleaf, reporting no geometry for a machine that has
+        // no fixed one; leaves 5 and 6 report no monitor or thermal features.
+        // Nothing is overclaimed, and a guest that needs one of those facts
+        // cannot act on a positive answer that is not there.
+        //
+        // Leaf 7 subleaf 0: EAX is the highest supported subleaf, zero here.
+        // EBX reports BMI1 and BMI2, whose full instruction lists execute in
+        // both engines; AVX2 stays clear while gathers, masked moves and
+        // VPMOVMSKB at 256 bits are refused, and every other bit names a
+        // feature with no implementation at all. Any other subleaf is
+        // undefined space and reads as zeros.
+        7 => {
+            if subleaf == 0 {
+                [0, CPUID7_BMI1 | CPUID7_BMI2, 0, 0]
+            } else {
+                [0; 4]
+            }
+        }
         // Highest extended leaf.
         0x8000_0000 => [0x8000_0001, 0, 0, 0],
         0x8000_0001 => [0, 0, CPUID_LAHF_SAHF | CPUID_LZCNT, CPUID_LONG_MODE],

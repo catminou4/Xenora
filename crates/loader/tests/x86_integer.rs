@@ -1039,14 +1039,22 @@ fn reference(m: &mut Machine, text: &str) -> Outcome {
         }
         "cpuid" => {
             // Xenora's guest CPUID contract, restated: the vendor "Xenora guest"
-            // and the eight features whose every instruction exists, TSC (EDX
+            // and the features whose every instruction exists, TSC (EDX
             // bit 4), CX8 (EDX bit 8), CMOV (EDX bit 15), CMPXCHG16B (ECX bit
-            // 13) and POPCNT (ECX bit 23) in leaf 1, LAHF/SAHF, LZCNT and long
+            // 13) and POPCNT (ECX bit 23) in leaf 1, BMI1 (EBX bit 3) and BMI2
+            // (EBX bit 8) in leaf 7 subleaf 0, LAHF/SAHF, LZCNT and long
             // mode in leaf 0x8000_0001.
             let word = |text: &[u8; 4]| u32::from_le_bytes(*text);
             let values = match m.gpr[RAX] as u32 {
-                0 => [1, word(b"Xeno"), word(b"uest"), word(b"ra g")],
+                0 => [7, word(b"Xeno"), word(b"uest"), word(b"ra g")],
                 1 => [0, 0, 1 << 13 | 1 << 23, 1 << 4 | 1 << 8 | 1 << 15],
+                7 => {
+                    if m.gpr[1] as u32 == 0 {
+                        [0, 1 << 3 | 1 << 8, 0, 0]
+                    } else {
+                        [0; 4]
+                    }
+                }
                 0x8000_0000 => [0x8000_0001, 0, 0, 0],
                 0x8000_0001 => [0, 0, 1 | 1 << 5, 1 << 29],
                 _ => [0; 4],

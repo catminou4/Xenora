@@ -76,8 +76,8 @@ const SET: RFlags = RFlags {
 fn every_leaf_returns_its_documented_values() {
     // (leaf, subleaf, [EAX, EBX, ECX, EDX])
     let leaves: &[(u32, u32, [u32; 4])] = &[
-        // Highest basic leaf 1, and "Xeno", "uest", "ra g" as little-endian text.
-        (0, 0, [1, 0x6F6E_6558, 0x7473_6575, 0x6720_6172]),
+        // Highest basic leaf 7, and "Xeno", "uest", "ra g" as little-endian text.
+        (0, 0, [7, 0x6F6E_6558, 0x7473_6575, 0x6720_6172]),
         // CMPXCHG16B is ECX bit 13, POPCNT ECX bit 23, TSC EDX bit 4,
         // CMPXCHG8B (CX8) EDX bit 8 and CMOV EDX bit 15. No signature.
         (1, 0, [0, 0, 0x0080_2000, 0x0000_8110]),
@@ -91,8 +91,11 @@ fn every_leaf_returns_its_documented_values() {
         (2, 0, [0; 4]),
         (4, 0, [0; 4]),
         (6, 0, [0; 4]),
-        (7, 0, [0; 4]),
+        // Leaf 7 subleaf 0: EAX zero further subleaves, BMI1 EBX bit 3 and
+        // BMI2 EBX bit 8. Every other subleaf is undefined space.
+        (7, 0, [0, 0x108, 0, 0]),
         (7, 1, [0; 4]),
+        (7, 0xFFFF_FFFF, [0; 4]),
         (0xB, 0, [0; 4]),
         (0xD, 1, [0; 4]),
         (0x16, 0, [0; 4]),
@@ -230,6 +233,33 @@ fn reported_features_have_all_their_instructions_in_the_fixtures() {
     // (0x8000_0001 EDX bit 27), which stays clear.
     assert_ne!(cpuid(1, 0)[EDX] & CPUID_TSC, 0);
     decodable("rdtsc");
+    // BMI1 and BMI2: every form of the fourteen instructions has fixture
+    // rows in integer.txt, all of which `tests/x86_integer.rs` runs through
+    // both engines against the independent reference. Here each instruction
+    // must have its rows and every one of them must decode.
+    use xenora_loader::cpu::{CPUID7_BMI1, CPUID7_BMI2};
+    assert_ne!(cpuid(7, 0)[EBX] & CPUID7_BMI1, 0);
+    assert_ne!(cpuid(7, 0)[EBX] & CPUID7_BMI2, 0);
+    for name in
+        "andn bextr blsi blsmsk blsr tzcnt bzhi mulx pdep pext rorx sarx shlx shrx".split(' ')
+    {
+        let rows: Vec<(&str, &str)> = fixture
+            .lines()
+            .filter_map(|line| line.split_once(" | "))
+            .filter(|(_, asm)| asm.split(' ').next() == Some(name))
+            .collect();
+        assert!(!rows.is_empty(), "no fixture rows for {name}");
+        for (hex, asm) in rows {
+            let code: Vec<u8> = hex
+                .split(' ')
+                .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+                .collect();
+            decode(ENTRY, |at| {
+                code.get((at - ENTRY) as usize).copied().ok_or(())
+            })
+            .unwrap_or_else(|error| panic!("{asm}: {error:?}"));
+        }
+    }
     // LAHF and SAHF have one form each and no operands.
     assert_ne!(cpuid(0x8000_0001, 0)[ECX] & CPUID_LAHF_SAHF, 0);
     decodable("lahf");
@@ -270,13 +300,9 @@ fn unreported_features_each_have_an_instruction_that_is_refused() {
         // the 256-bit immediate shuffles are implemented; moving the 256-bit
         // byte mask to a general register is still refused.
         ("AVX2", 7, EBX, 5, &[0xC5, 0xFD, 0xD7, 0xC1]), // vpmovmskb eax, ymm1
-        // All defined BMI2 forms now execute; CPUID still withholds the bit
-        // pending independent acceptance. VEX.L=1 is reserved for PDEP, so the
-        // 256-bit encoding is an honest refused witness.
-        ("BMI2", 7, EBX, 8, &[0xC4, 0xE2, 0x37, 0xF5, 0xD9]), // reserved VEX.L=1 pdep
-        ("RDSEED", 7, EBX, 18, &[0x0F, 0xC7, 0xF8]),          // rdseed eax
+        ("RDSEED", 7, EBX, 18, &[0x0F, 0xC7, 0xF8]),    // rdseed eax
         ("ADX", 7, EBX, 19, &[0x66, 0x0F, 0x38, 0xF6, 0xC1]), // adcx eax, ecx
-        ("SHA", 7, EBX, 29, &[0x0F, 0x38, 0xC9, 0xC1]),       // sha1msg1 xmm0, xmm1
+        ("SHA", 7, EBX, 29, &[0x0F, 0x38, 0xC9, 0xC1]), // sha1msg1 xmm0, xmm1
         ("PREFETCHW", 0x8000_0001, ECX, 8, &[0x0F, 0x0D, 0x0E]), // prefetchw [rsi]
         ("SYSCALL/SYSRET", 0x8000_0001, EDX, 11, &[0x48, 0x0F, 0x07]), // sysretq
         ("RDTSCP", 0x8000_0001, EDX, 27, &[0x0F, 0x01, 0xF9]), // rdtscp
@@ -316,6 +342,33 @@ fn f16c_is_implemented_but_unreported() {
             "{engine}: {exit:?}"
         );
         assert_eq!(state.xmm[0], 0x3F80_0000, "{engine}");
+    }
+}
+
+/// BMI1 and BMI2 are complete — every form of ANDN, BEXTR, BLSI, BLSMSK,
+/// BLSR, TZCNT, BZHI, MULX, PDEP, PEXT, RORX, SARX, SHLX and SHRX executes in
+/// both engines — so leaf 7 reports both bits, and a guest that tests them
+/// before using the forms reaches working instructions.
+#[test]
+fn bmi1_and_bmi2_are_complete_and_reported() {
+    use xenora_loader::cpu::{CPUID7_BMI1, CPUID7_BMI2};
+    let ebx = cpuid(7, 0)[EBX];
+    assert_ne!(ebx & CPUID7_BMI1, 0, "BMI1 reported");
+    assert_ne!(ebx & CPUID7_BMI2, 0, "BMI2 reported");
+    assert_eq!(cpuid(7, 0)[0], 0, "subleaf 0 is the only feature leaf");
+    // One execution sample per set: the fixture suites cover every form in
+    // both engines; here the bit a guest tests answers the truth.
+    for (code, what) in [
+        (&[0xC4, 0xE2, 0x33, 0xF5, 0xD9][..], "pdep ebx, r9d, ecx"),
+        (&[0xC4, 0xE2, 0x73, 0xF6, 0xC2][..], "mulx eax, ecx, edx"),
+    ] {
+        let cpu = CpuState::new(ENTRY, 0);
+        for (engine, _state, exit) in both(&cpu, code, 1) {
+            assert!(
+                !matches!(exit, ExitReason::IllegalInstruction(_)),
+                "{what} refused on the {engine}: {exit:?}"
+            );
+        }
     }
 }
 
